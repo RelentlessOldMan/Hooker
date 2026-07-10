@@ -23,7 +23,9 @@ Each tile is labeled with the session's **`/name`** (falling back to its folder)
 
 ## The widget
 
-A borderless, always-on-top strip. One tile per live session.
+A borderless, always-on-top strip. One tile per live session — here it is docked next to the system tray:
+
+![Hooker docked by the tray](docs/on-taskbar.png)
 
 - **Left-click a tile** — toggle that session's hooking (salmon ⇄ grey).
 - **Drag a tile** — reorder it (works locked or not), to match your terminal layout.
