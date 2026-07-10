@@ -46,11 +46,11 @@ sealed class Session
     public long Count;
     public bool Hooking;                 // salmon vs grey mascot
     public string Name = "";             // /name title, from Claude's session registry
-    public string Reg = "";              // Claude's live status ("busy" = actively working)
+    public string LiveStatus = "";       // Claude's own status for the session ("busy" = working)
 
     // Working (yellow) if Claude says it's busy OR our hooks saw activity — so the tile
     // reflects "thinking" even before any tool runs.
-    public bool Working => Reg == "busy" || Status == "working";
+    public bool Working => LiveStatus == "busy" || Status == "working";
 }
 
 sealed class WidgetConfig
@@ -395,8 +395,8 @@ sealed class WidgetForm : Form
         var reg = LoadRegistry();
         foreach (var kv in _sessions)
         {
-            if (reg.TryGetValue(kv.Key, out var info)) { kv.Value.Name = info.name; kv.Value.Reg = info.status; }
-            else { kv.Value.Name = ""; kv.Value.Reg = ""; }
+            if (reg.TryGetValue(kv.Key, out var info)) { kv.Value.Name = info.name; kv.Value.LiveStatus = info.status; }
+            else { kv.Value.Name = ""; kv.Value.LiveStatus = ""; }
         }
     }
 
@@ -431,6 +431,7 @@ sealed class WidgetForm : Form
         return map;
     }
 
+    // Lowercase keys mirror the .meta JSON the shim writes.
     sealed class MetaDto
     {
         public string status { get; set; } = "working";

@@ -144,6 +144,7 @@ catch
 
 return 0;
 
+// Lowercase property names mirror the on-disk .meta JSON keys the widget reads.
 sealed class Meta
 {
     public string status { get; set; } = "working";

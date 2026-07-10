@@ -66,25 +66,34 @@ The widget also reads Claude's internal per-session registry (`~/.claude/session
 
 The shim **fails open**: any error → prints nothing, exits 0 → Claude behaves normally. It never blocks Claude.
 
-## Setup
+## Install (just want to use it)
 
-Requires the **.NET 8 runtime** (`dotnet --version`). Python + Pillow only to regenerate icons.
+No building — five steps, all double-clicks:
 
-1. **Build** → `dist\hook.exe` and `dist\HookerWidget.exe`:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\build.ps1
-   ```
-2. **Register the hooks** — double-click **`Install Hooker.cmd`** (reliable), or run `install-hook.ps1` directly.
-   > Claude Code's safety guard won't let *Claude* write this hook for you — it's a permission bypass, so you install it deliberately. Backs up your settings first and preserves any hooks you already had.
-3. **Restart** any running Claude Code sessions so they load the hooks.
-4. **Run** `dist\HookerWidget.exe` (a tile appears per session).
+1. **Install the runtime** (one time). Download the free **[.NET Desktop Runtime 8](https://dotnet.microsoft.com/download/dotnet/8.0)** — under **"Run desktop apps"**, grab the **Windows x64** installer — and run it.
+2. **Download Hooker.** Get the latest [**release**](../../releases) `.zip`, then right-click it → **Extract All**.
+3. **Turn on the hooks.** Double-click **`Install Hooker.cmd`**. A window opens, prints *"Installed…"*, and waits for a keypress. *(It registers Hooker with Claude Code and backs up your existing settings first.)*
+4. **Restart Claude Code.** Close and reopen any `claude` terminals so they load the hooks.
+5. **Run the widget.** Double-click **`HookerWidget.exe`**. The mascot strip appears near your clock. **Click a tile** to put that session on autopilot (salmon = auto-approving); click again for manual (grey).
 
-A login shortcut can live at `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Hooker.lnk`. Remove it with:
+> ⚠️ Autopilot auto-approves **everything** for that session — read [Security](#️-security--read-this) first.
+
+**Auto-start at login:** drop a shortcut to `HookerWidget.exe` into `shell:startup` (Win+R → `shell:startup`).
+
+### Build from source instead
+
+Needs the **.NET 8 SDK**. Then:
 ```powershell
-Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'Hooker.lnk')
+powershell -ExecutionPolicy Bypass -File .\build.ps1          # -> dist\hook.exe, dist\HookerWidget.exe
+powershell -ExecutionPolicy Bypass -File .\install-hook.ps1   # register hooks (or double-click "Install Hooker.cmd")
 ```
+Restart Claude and run `dist\HookerWidget.exe`.
 
-> **Moved or re-cloned the repo?** The hook command is an absolute path baked into `settings.json`, so re-run the installer after moving `dist\hook.exe`.
+> **Moved or re-cloned the folder?** The hook command is an absolute path in `settings.json`, so re-run the installer after moving `hook.exe`.
+
+## Contributing
+
+This is a personal tool, published as-is — **issues and pull requests aren't accepted** (PRs auto-close). Fork it and make it your own. 🪝
 
 ## Uninstall
 
