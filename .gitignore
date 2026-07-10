@@ -8,3 +8,7 @@ dist/
 # python
 __pycache__/
 *.pyc
+
+# release artifacts
+release-tmp/
+*.zip
