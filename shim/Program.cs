@@ -76,7 +76,10 @@ try
         try
         {
             Directory.CreateDirectory(sessionsDir);
-            File.WriteAllText(metaPath, JsonSerializer.Serialize(m));
+            // Write-then-rename so the widget never reads a half-written .meta.
+            var tmp = metaPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(m));
+            File.Move(tmp, metaPath, overwrite: true);
         }
         catch { }
     }

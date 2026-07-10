@@ -1,10 +1,10 @@
 # Installs the Hooker hooks into %USERPROFILE%\.claude\settings.json.
-# Run this yourself:  ! powershell -ExecutionPolicy Bypass -File C:\Playground\Hooker\install-hook.ps1
+# Run it yourself — double-click "Install Hooker.cmd", or run this .ps1 directly.
 #
-# It registers hook.exe for PreToolUse (auto-approve when hooking) plus
-# UserPromptSubmit / Notification / Stop (drive the working/waiting status light).
-# Existing settings are backed up to settings.json.hooker-backup and any other
-# hook events you already have are preserved.
+# It registers hook.exe on PreToolUse (auto-approve when hooking) plus
+# UserPromptSubmit / Notification / Stop / SessionStart / SessionEnd (status + lifecycle).
+# Your settings are backed up to settings.json.hooker-backup, and any hooks you
+# already had are preserved — only a previous Hooker entry is replaced on re-install.
 
 $ErrorActionPreference = 'Stop'
 
@@ -27,9 +27,9 @@ if (Test-Path $settings) {
     $json = [pscustomobject]@{}
 }
 
-$cmd        = [pscustomobject]@{ type = 'command'; command = $hookExe }
-$withMatch  = [pscustomobject]@{ matcher = '*'; hooks = @($cmd) }
-$noMatch    = [pscustomobject]@{ hooks = @($cmd) }
+$cmd       = [pscustomobject]@{ type = 'command'; command = $hookExe }
+$withMatch = [pscustomobject]@{ matcher = '*'; hooks = @($cmd) }
+$noMatch   = [pscustomobject]@{ hooks = @($cmd) }
 
 if (-not ($json.PSObject.Properties.Name -contains 'hooks')) {
     $json | Add-Member -NotePropertyName hooks -NotePropertyValue ([pscustomobject]@{})
@@ -44,11 +44,20 @@ $events = @{
     SessionEnd       = $noMatch
 }
 foreach ($e in $events.Keys) {
-    $grp = @($events[$e])
-    if ($json.hooks.PSObject.Properties.Name -contains $e) { $json.hooks.$e = $grp }
-    else { $json.hooks | Add-Member -NotePropertyName $e -NotePropertyValue $grp }
+    $ourGrp = $events[$e]
+    if ($json.hooks.PSObject.Properties.Name -contains $e) {
+        # Keep hooks you already had for this event; drop only a prior Hooker entry.
+        $kept = @($json.hooks.$e | Where-Object {
+            -not ($_.hooks | Where-Object { $_.command -eq $hookExe })
+        })
+        $json.hooks.$e = @($kept + $ourGrp)
+    } else {
+        $json.hooks | Add-Member -NotePropertyName $e -NotePropertyValue @($ourGrp)
+    }
 }
 
-$json | ConvertTo-Json -Depth 10 | Set-Content $settings -Encoding utf8
+# Write BOM-less UTF-8 (Set-Content -Encoding utf8 adds a BOM on Windows PowerShell 5.1).
+$out = $json | ConvertTo-Json -Depth 10
+[System.IO.File]::WriteAllText($settings, $out, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "Installed Hooker hooks into $settings"
 Write-Host "Restart any running Claude Code sessions to pick up the hooks."

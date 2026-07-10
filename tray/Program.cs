@@ -1,13 +1,14 @@
 // Hooker widget — a small always-on-top strip of per-session mascot tiles.
 //
-//   left-click a tile      : toggle that session's hooking (red <-> green)
+//   left-click a tile      : toggle that session's hooking (salmon = auto, grey = manual)
 //   drag a tile            : reorder it (works whether or not position is locked)
 //   drag the grip (left)   : move the whole widget  (only when position is UNLOCKED)
-//   right-click            : menu -> Lock position, new-session side, grow direction, Exit
+//   right-click            : menu -> Dismiss, Lock position, new-session side, grow dir, Exit
 //
-// Each tile is colored from that session's .meta (green=working, yellow=waiting)
-// unless the session is hooking, then red. Auto-approve is per session and lives
-// entirely in the shim; this widget just writes each session's on/off .state.
+// Two axes per tile: background = needs-you (green = waiting on you, yellow = working),
+// mascot = enabled (salmon = hooking/auto-approve, grey = manual). Auto-approve is per
+// session and lives entirely in the shim; this widget just writes each session's on/off
+// .state and reads its .meta + Claude's session registry (for /name and live busy) to render.
 //
 // Growth: when tiles are added/removed the strip keeps one edge pinned. "Anchor"
 // picks which edge (auto = whichever screen half the widget sits on) so a
@@ -31,16 +32,25 @@ static class Program
         using var mutex = new Mutex(true, "Hooker.Widget.SingleInstance", out bool isNew);
         if (!isNew) return;
         ApplicationConfiguration.Initialize();
+        // A transient WinForms hiccup should never kill an always-on widget.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, _) => { };
         Application.Run(new WidgetForm());
     }
 }
 
 sealed class Session
 {
-    public string Status = "working";   // working | waiting  -> background tint
+    public string Status = "working";   // hook-derived: working | waiting
     public string Cwd = "";
     public long Count;
     public bool Hooking;                 // salmon vs grey mascot
+    public string Name = "";             // /name title, from Claude's session registry
+    public string Reg = "";              // Claude's live status ("busy" = actively working)
+
+    // Working (yellow) if Claude says it's busy OR our hooks saw activity — so the tile
+    // reflects "thinking" even before any tool runs.
+    public bool Working => Reg == "busy" || Status == "working";
 }
 
 sealed class WidgetConfig
@@ -52,7 +62,6 @@ sealed class WidgetConfig
     public string NewSide { get; set; } = "right";  // right | left
     public double StaleHours { get; set; } = 24;    // prune a tile after this long with no hook event (0 = never)
     public List<string> Order { get; set; } = new();
-    public Dictionary<string, string> Labels { get; set; } = new();  // sid -> custom name
 }
 
 sealed class WidgetForm : Form
@@ -65,7 +74,12 @@ sealed class WidgetForm : Form
     static readonly string ConfigPath = Path.Combine(HookerDir, "widget.json");
 
     readonly Bitmap _workOn, _workOff, _waitOn, _waitOff;
+    readonly string _version;
     readonly System.Windows.Forms.Timer _poll;
+
+    delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int obj, int child, uint thread, uint time);
+    readonly WinEventProc _winEventProc;
+    IntPtr _winEventHook;
     readonly TipWindow _tip = new();
     readonly ContextMenuStrip _menu = new();
     ToolStripMenuItem _lockItem = null!, _newRight = null!, _newLeft = null!,
@@ -74,11 +88,12 @@ sealed class WidgetForm : Form
 
     readonly List<string> _order = new();
     readonly Dictionary<string, Session> _sessions = new();
-    Dictionary<string, string> _labels = new();
     bool _locked;
     string _anchor = "auto";
     string _newSide = "right";
-    double _staleHours = 4;
+    double _staleHours = 24;
+    int _tick;
+    string _sig = "";
 
     enum Hit { None, Grip, Tile }
     Hit _hitKind;
@@ -94,6 +109,9 @@ sealed class WidgetForm : Form
         _waitOn = LoadPng("wait_on.png");
         _waitOff = LoadPng("wait_off.png");
 
+        var v = Assembly.GetExecutingAssembly().GetName().Version;
+        _version = v is null ? "" : $"v{v.Major}.{v.Minor}.{v.Build}";
+
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
@@ -108,9 +126,15 @@ sealed class WidgetForm : Form
         SyncSessions();
         InitialLayout();
 
-        _poll = new System.Windows.Forms.Timer { Interval = 250 };
+        _poll = new System.Windows.Forms.Timer { Interval = 100 };
         _poll.Tick += (_, _) => Tick();
         _poll.Start();
+
+        // Re-assert topmost the instant the foreground window changes (e.g. pressing Win
+        // raises the taskbar/Start), so the shell can't jump in front of us.
+        _winEventProc = OnForegroundChanged;
+        _winEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
     }
 
     protected override CreateParams CreateParams
@@ -154,9 +178,10 @@ sealed class WidgetForm : Form
     void ShowMenu(Point p, string? tileSid)
     {
         _menu.Items.Clear();
+        _menu.Items.Add(new ToolStripMenuItem($"Hooker {_version}") { Enabled = false });
+        _menu.Items.Add(new ToolStripSeparator());
         if (tileSid != null && _sessions.ContainsKey(tileSid))
         {
-            _menu.Items.Add(new ToolStripMenuItem("Rename…", null, (_, _) => RenameSession(tileSid)));
             _menu.Items.Add(new ToolStripMenuItem($"Dismiss “{FolderOf(tileSid)}”",
                 null, (_, _) => DismissSession(tileSid)));
             _menu.Items.Add(new ToolStripSeparator());
@@ -168,12 +193,12 @@ sealed class WidgetForm : Form
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Reset position", null, (_, _) => ResetPosition()));
         _menu.Items.Add(_exitItem);
+        SetForegroundWindow(Handle);   // lets the menu dismiss on ANY outside click, not just the grip
         _menu.Show(this, p);
     }
 
     string FolderOf(string sid) =>
-        _sessions.TryGetValue(sid, out var s) && s.Cwd.Length > 0
-            ? Path.GetFileName(s.Cwd.TrimEnd('/', '\\')) : "session";
+        _sessions.TryGetValue(sid, out var s) ? DisplayName(s) : "session";
 
     void DismissSession(string sid)
     {
@@ -181,46 +206,8 @@ sealed class WidgetForm : Form
         try { File.Delete(Path.Combine(SessionsDir, sid + ".state")); } catch { }
         _order.Remove(sid);
         _sessions.Remove(sid);
-        _labels.Remove(sid);
         SaveConfig();
         Tick();
-    }
-
-    void RenameSession(string sid)
-    {
-        var current = _labels.GetValueOrDefault(sid, "");
-        var name = Prompt("Name this session (blank to clear):", current);
-        if (name == null) return;                     // cancelled
-        if (name.Length == 0) _labels.Remove(sid);
-        else _labels[sid] = name;
-        SaveConfig();
-        _hoverText = "";                              // force the tooltip to refresh
-        Invalidate();
-    }
-
-    // Minimal modal text prompt (WinForms has no built-in InputBox).
-    string? Prompt(string caption, string initial)
-    {
-        using var f = new Form
-        {
-            Text = "Rename",
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterScreen,
-            ClientSize = new Size(320, 96),
-            MinimizeBox = false,
-            MaximizeBox = false,
-            ShowInTaskbar = false,
-            TopMost = true,
-        };
-        var lbl = new Label { Left = 12, Top = 10, Width = 296, Text = caption };
-        var tb = new TextBox { Left = 12, Top = 32, Width = 296, Text = initial };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 152, Top = 62, Width = 75 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 233, Top = 62, Width = 75 };
-        f.Controls.AddRange(new Control[] { lbl, tb, ok, cancel });
-        f.AcceptButton = ok;
-        f.CancelButton = cancel;
-        tb.SelectAll();
-        return f.ShowDialog() == DialogResult.OK ? tb.Text.Trim() : null;
     }
 
     void RefreshMenuChecks()
@@ -256,31 +243,48 @@ sealed class WidgetForm : Form
 
     void Tick()
     {
-        SyncSessions();
-
-        if (ShouldHideForFullscreen() || _order.Count == 0)
+        try
         {
-            if (Visible) { Visible = false; _tip.HideTip(); _hoverSid = ""; _hoverText = ""; }
-            return;
-        }
+            SyncSessions();
 
-        var want = ContentSize();
-        if (want != Size)
-        {
-            bool anchorRight = EffectiveAnchorRight();   // decide from the pre-resize position
-            int oldRight = Right;
-            Size = want;
-            // Height is constant with session count, so Y never changes here (no vertical
-            // jump). Keep the anchored horizontal edge; only clamp X, and only when unlocked
-            // so a locked widget stays exactly where you put it (even over the taskbar).
-            if (anchorRight) Location = new Point(oldRight - want.Width, Location.Y);
-            if (!_locked) ClampX();
-            UpdateRegion();
+            if (ShouldHideForFullscreen() || _order.Count == 0)
+            {
+                if (Visible) { Visible = false; _tip.HideTip(); _hoverSid = ""; _hoverText = ""; }
+                return;
+            }
+
+            var want = ContentSize();
+            if (want != Size)
+            {
+                bool anchorRight = EffectiveAnchorRight();   // decide from the pre-resize position
+                int oldRight = Right;
+                Size = want;
+                // Height is constant with session count, so Y never changes here (no vertical
+                // jump). Keep the anchored horizontal edge; only clamp X, and only when unlocked
+                // so a locked widget stays exactly where you put it (even over the taskbar).
+                if (anchorRight) Location = new Point(oldRight - want.Width, Location.Y);
+                if (!_locked) ClampX();
+                UpdateRegion();
+            }
+            if (!Visible) Visible = true;
+            if (++_tick % 10 == 0) AssertTopmost();   // ~1s belt-and-suspenders; the foreground hook does the rest
+            if (!_moved) UpdateHover(PointToClient(Cursor.Position));
+
+            var sig = VisualSig();                    // only repaint when a tile's appearance actually changed
+            if (sig != _sig) { _sig = sig; Invalidate(); }
         }
-        if (!Visible) Visible = true;
-        AssertTopmost();                                           // stay in front of the (also-topmost) taskbar
-        if (!_moved) UpdateHover(PointToClient(Cursor.Position));   // keep tooltip in sync with live data
-        Invalidate();
+        catch { /* never let the always-on widget die on a transient error */ }
+    }
+
+    string VisualSig()
+    {
+        var sb = new System.Text.StringBuilder(_order.Count * 40);
+        foreach (var sid in _order)
+        {
+            var s = _sessions[sid];
+            sb.Append(sid).Append(s.Working ? '1' : '0').Append(s.Hooking ? '1' : '0').Append('|');
+        }
+        return sb.ToString();
     }
 
     void ClampX()
@@ -378,7 +382,7 @@ sealed class WidgetForm : Form
 
         bool changed = false;
         for (int i = _order.Count - 1; i >= 0; i--)
-            if (!live.Contains(_order[i])) { _labels.Remove(_order[i]); _sessions.Remove(_order[i]); _order.RemoveAt(i); changed = true; }
+            if (!live.Contains(_order[i])) { _sessions.Remove(_order[i]); _order.RemoveAt(i); changed = true; }
         foreach (var sid in live)
             if (!_order.Contains(sid))
             {
@@ -386,6 +390,45 @@ sealed class WidgetForm : Form
                 changed = true;
             }
         if (changed) SaveConfig();
+
+        // Pull /name and live busy/idle status from Claude's own session registry.
+        var reg = LoadRegistry();
+        foreach (var kv in _sessions)
+        {
+            if (reg.TryGetValue(kv.Key, out var info)) { kv.Value.Name = info.name; kv.Value.Reg = info.status; }
+            else { kv.Value.Name = ""; kv.Value.Reg = ""; }
+        }
+    }
+
+    // Read Claude Code's per-session registry (~/.claude/sessions/<pid>.json): maps our
+    // session id -> (/name title, live status). Undocumented/internal, so best-effort —
+    // any failure just leaves name/status blank and we fall back to folder + hook signal.
+    static Dictionary<string, (string name, string status)> LoadRegistry()
+    {
+        var map = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "sessions");
+            if (!Directory.Exists(dir)) return map;
+            foreach (var f in Directory.GetFiles(dir, "*.json"))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(f));
+                    var r = doc.RootElement;
+                    if (!r.TryGetProperty("sessionId", out var sidEl)) continue;
+                    var sid = sidEl.GetString();
+                    if (string.IsNullOrEmpty(sid)) continue;
+                    var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
+                    var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
+                    map[sid] = (name, status);
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return map;
     }
 
     sealed class MetaDto
@@ -434,8 +477,8 @@ sealed class WidgetForm : Form
     }
 
     Bitmap TileFor(Session s) =>
-        s.Status == "waiting" ? (s.Hooking ? _waitOn : _waitOff)
-                              : (s.Hooking ? _workOn : _workOff);
+        s.Working ? (s.Hooking ? _workOn : _workOff)
+                  : (s.Hooking ? _waitOn : _waitOff);
 
     static GraphicsPath Rounded(Rectangle r, int radius)
     {
@@ -534,13 +577,14 @@ sealed class WidgetForm : Form
     string TileTooltip(string sid)
     {
         var s = _sessions[sid];
-        var name = _labels.TryGetValue(sid, out var lbl) && lbl.Length > 0
-            ? lbl
-            : (s.Cwd.Length == 0 ? "session" : Path.GetFileName(s.Cwd.TrimEnd('/', '\\')));
         var enabled = s.Hooking ? "hooking" : "manual";
-        var need = s.Status == "waiting" ? "waiting on you" : "working";
-        return $"{name}\n{enabled} · {need}\n{s.Count} auto-approval{(s.Count == 1 ? "" : "s")}";
+        var need = s.Working ? "working" : "waiting on you";
+        return $"{DisplayName(s)}\n{enabled} · {need}\n{s.Count} auto-approval{(s.Count == 1 ? "" : "s")}";
     }
+
+    static string DisplayName(Session s) =>
+        !string.IsNullOrWhiteSpace(s.Name) ? s.Name
+        : (s.Cwd.Length == 0 ? "session" : Path.GetFileName(s.Cwd.TrimEnd('/', '\\')));
 
     void ToggleSession(string sid)
     {
@@ -598,7 +642,6 @@ sealed class WidgetForm : Form
                     _newSide = c.NewSide;
                     _staleHours = c.StaleHours;
                     _order.AddRange(c.Order);
-                    if (c.Labels != null) _labels = c.Labels;
                     if (c.X >= 0 && c.Y >= 0) Location = new Point(c.X, c.Y);
                 }
             }
@@ -615,8 +658,7 @@ sealed class WidgetForm : Form
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(new WidgetConfig
             {
                 X = Location.X, Y = Location.Y, Locked = _locked,
-                Anchor = _anchor, NewSide = _newSide, StaleHours = _staleHours,
-                Order = new(_order), Labels = new(_labels),
+                Anchor = _anchor, NewSide = _newSide, StaleHours = _staleHours, Order = new(_order),
             }));
         }
         catch { }
@@ -624,10 +666,24 @@ sealed class WidgetForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
         foreach (var sid in _order)                 // never leave a session auto-approving
             try { File.WriteAllText(Path.Combine(SessionsDir, sid + ".state"), "off"); } catch { }
         SaveConfig();
         base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
+            _poll?.Dispose();
+            _menu?.Dispose();
+            _tip?.Dispose();
+            _workOn?.Dispose(); _workOff?.Dispose(); _waitOn?.Dispose(); _waitOff?.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     // ---- Win32 -----------------------------------------------------------
@@ -635,6 +691,7 @@ sealed class WidgetForm : Form
     const uint MONITOR_DEFAULTTONEAREST = 2;
     static readonly IntPtr HWND_TOPMOST = new(-1);
     const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
+    const uint EVENT_SYSTEM_FOREGROUND = 0x0003, WINEVENT_OUTOFCONTEXT = 0x0000;
 
     void AssertTopmost()
     {
@@ -642,11 +699,19 @@ sealed class WidgetForm : Form
         catch { }
     }
 
+    void OnForegroundChanged(IntPtr hook, uint evt, IntPtr hwnd, int obj, int child, uint thread, uint time)
+    {
+        if (Visible && !ShouldHideForFullscreen()) AssertTopmost();
+    }
+
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO mi);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmod, WinEventProc proc, uint idProcess, uint idThread, uint dwFlags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
     [StructLayout(LayoutKind.Sequential)]
     struct RECT { public int left, top, right, bottom; }

@@ -101,6 +101,8 @@ def build(tk, tint, bk, body):
 
 
 if __name__ == "__main__":
+    if not SRC.exists():
+        raise SystemExit(f"Mascot source not found: {SRC}")
     for tk, tint in TINTS.items():
         for bk, body in BODIES.items():
             build(tk, tint, bk, body)
