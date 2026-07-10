@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>HookerWidget</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Two axes: background = working/waiting, mascot = hooking(salmon)/manual(grey). -->
+    <EmbeddedResource Include="..\assets\tile-work_on.png" LogicalName="work_on.png" />
+    <EmbeddedResource Include="..\assets\tile-work_off.png" LogicalName="work_off.png" />
+    <EmbeddedResource Include="..\assets\tile-wait_on.png" LogicalName="wait_on.png" />
+    <EmbeddedResource Include="..\assets\tile-wait_off.png" LogicalName="wait_off.png" />
+  </ItemGroup>
+
+</Project>

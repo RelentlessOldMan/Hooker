@@ -1,0 +1,10 @@
+# .NET build output
+bin/
+obj/
+
+# published binaries (rebuild with build.ps1)
+dist/
+
+# python
+__pycache__/
+*.pyc
