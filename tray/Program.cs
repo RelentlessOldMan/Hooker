@@ -46,11 +46,15 @@ sealed class Session
     public long Count;
     public bool Hooking;                 // salmon vs grey mascot
     public string Name = "";             // /name title, from Claude's session registry
-    public string LiveStatus = "";       // Claude's own status for the session ("busy" = working)
+    public string LiveStatus = "";       // Claude's own status for the session ("busy"/"idle"/...), "" if not in registry
 
-    // Working (yellow) if Claude says it's busy OR our hooks saw activity — so the tile
-    // reflects "thinking" even before any tool runs.
-    public bool Working => LiveStatus == "busy" || Status == "working";
+    // Claude's live registry status is authoritative when present: it's updated
+    // continuously, so "idle" reliably clears once a turn ends. Our hook .meta is only
+    // edge-triggered (working on activity, waiting on Stop) and gets stuck at "working"
+    // if a closing Stop never fires — so trust it ONLY as a fallback when the registry
+    // is silent about this session (undocumented API absent/changed).
+    public bool Working => LiveStatus.Length > 0 ? LiveStatus == "busy"
+                                                 : Status == "working";
 }
 
 sealed class WidgetConfig
