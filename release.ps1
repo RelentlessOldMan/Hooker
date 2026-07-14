@@ -37,6 +37,9 @@ Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
 
 # 5. Create the GitHub release with the zip attached.
+# Pass notes via a temp file (--notes-file), NOT --notes: Windows PowerShell 5.1 mangles a
+# native-command argument that contains embedded double-quotes (the notes' *"Run desktop apps"*),
+# splitting it into stray words that gh then tries to attach as asset files ("CreateFile desktop").
 $notes = @'
 **Prebuilt Windows build** (framework-dependent, x64).
 
@@ -46,7 +49,10 @@ Requires the free [.NET Desktop Runtime 8](https://dotnet.microsoft.com/download
 
 WARNING: putting a session on autopilot (salmon tile) auto-approves every prompt for it — read the README security note first.
 '@
-gh release create "v$ver" $zip --title "Hooker v$ver" --notes $notes
+$notesFile = Join-Path $env:TEMP "hooker-relnotes-$ver.md"
+Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8
+try { gh release create "v$ver" "$zip" --title "Hooker v$ver" --notes-file $notesFile }
+finally { Remove-Item $notesFile -Force -ErrorAction SilentlyContinue }
 
 # 6. Clean up and relaunch the widget if it had been running.
 Remove-Item $zip -ErrorAction SilentlyContinue
