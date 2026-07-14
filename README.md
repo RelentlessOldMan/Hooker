@@ -39,7 +39,7 @@ It stays **in front of the taskbar**, **hides** while a fullscreen app owns the 
 
 ### Stale tiles
 
-A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't, so the widget **auto-prunes** any tile silent for `StaleHours` (default **24h**, `0` disables in `widget.json`) — self-healing, since the session's next hook event recreates its tile. Right-click → **Dismiss** clears one instantly.
+A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it (which Claude does even on an abrupt close), its tile is **evicted within ~1.5s**. If the registry is unavailable, it falls back to **auto-pruning** any tile silent for `StaleHours` (default **24h**, `0` disables in `widget.json`). Both self-heal — a live session's next hook event recreates its tile — and right-click → **Dismiss** clears one instantly.
 
 ## ⚠️ Security — read this
 

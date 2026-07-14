@@ -71,6 +71,7 @@ sealed class WidgetConfig
 sealed class WidgetForm : Form
 {
     const int Tile = 51, Gap = 7, Grip = 16, Pad = 7, Radius = 12, DragThreshold = 5;
+    const int RegMissesToPrune = 15;   // ticks a session may be registry-absent (poll=100ms => ~1.5s) before its tile is evicted
 
     static readonly string HookerDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "hooker");
@@ -92,6 +93,8 @@ sealed class WidgetForm : Form
 
     readonly List<string> _order = new();
     readonly Dictionary<string, Session> _sessions = new();
+    readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
+    readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
     bool _locked;
     string _anchor = "auto";
     string _newSide = "right";
@@ -204,10 +207,16 @@ sealed class WidgetForm : Form
     string FolderOf(string sid) =>
         _sessions.TryGetValue(sid, out var s) ? DisplayName(s) : "session";
 
-    void DismissSession(string sid)
+    void DeleteSessionFiles(string sid)
     {
         try { File.Delete(Path.Combine(SessionsDir, sid + ".meta")); } catch { }
         try { File.Delete(Path.Combine(SessionsDir, sid + ".state")); } catch { }
+    }
+
+    void DismissSession(string sid)
+    {
+        DeleteSessionFiles(sid);
+        _regMiss.Remove(sid);
         _order.Remove(sid);
         _sessions.Remove(sid);
         SaveConfig();
@@ -347,6 +356,13 @@ sealed class WidgetForm : Form
 
     void SyncSessions()
     {
+        // Claude's per-session registry (files named by PID) is our liveness signal: Claude
+        // drops a session's entry the moment it goes away — even on an abrupt close that skips
+        // SessionEnd — so a .meta with no registry entry means the session is dead.
+        var reg = LoadRegistry();
+        bool regUsable = reg.Count > 0;   // empty => registry unavailable/undocumented-shape-changed; don't prune blind
+        foreach (var sid in reg.Keys) _seenInReg.Add(sid);
+
         List<string> live = new();
         try
         {
@@ -356,13 +372,25 @@ sealed class WidgetForm : Form
             {
                 var sid = Path.GetFileNameWithoutExtension(f);
 
-                // Prune a tile whose session hasn't fired a hook event in StaleHours
-                // (an abrupt close that skipped SessionEnd). Self-heals: if that
-                // session is actually alive, its next event recreates the .meta.
+                // Primary prune: a session Claude once registered but has since dropped is
+                // gone — evict its tile within ~1.5s (no 24h wait, no clean /exit needed).
+                // Require a few consecutive misses so a mid-write registry blip can't evict a
+                // live session; gated on _seenInReg so a start-up race (a fresh .meta whose
+                // registry entry hasn't appeared yet) is never mistaken for a dead session.
+                if (regUsable && _seenInReg.Contains(sid) && !reg.ContainsKey(sid))
+                {
+                    int n = _regMiss.TryGetValue(sid, out var c) ? c + 1 : 1;
+                    if (n >= RegMissesToPrune) { _regMiss.Remove(sid); DeleteSessionFiles(sid); continue; }
+                    _regMiss[sid] = n;   // keep rendering the tile until the miss budget is spent
+                }
+                else _regMiss.Remove(sid);
+
+                // Fallback prune: abrupt close where the registry is ALSO unavailable — drop a
+                // tile with no hook event in StaleHours. Self-heals: a live session's next
+                // event recreates the .meta.
                 if (_staleHours > 0 && File.GetLastWriteTimeUtc(f) < cutoff)
                 {
-                    try { File.Delete(f); } catch { }
-                    try { File.Delete(Path.Combine(SessionsDir, sid + ".state")); } catch { }
+                    DeleteSessionFiles(sid);
                     continue;
                 }
 
@@ -395,8 +423,7 @@ sealed class WidgetForm : Form
             }
         if (changed) SaveConfig();
 
-        // Pull /name and live busy/idle status from Claude's own session registry.
-        var reg = LoadRegistry();
+        // Apply /name and live busy/idle status from the registry we already loaded.
         foreach (var kv in _sessions)
         {
             if (reg.TryGetValue(kv.Key, out var info)) { kv.Value.Name = info.name; kv.Value.LiveStatus = info.status; }
