@@ -17,6 +17,7 @@
 // Position, lock, order, anchor, and new-session side persist to hooker\widget.json.
 // The strip hides while a fullscreen app owns the same monitor (games safe).
 
+using Microsoft.Win32;
 using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -64,7 +65,6 @@ sealed class WidgetConfig
     public bool Locked { get; set; }
     public string Anchor { get; set; } = "auto";   // auto | left | right
     public string NewSide { get; set; } = "right";  // right | left
-    public double StaleHours { get; set; } = 24;    // prune a tile after this long with no hook event (0 = never)
     public List<string> Order { get; set; } = new();
 }
 
@@ -98,7 +98,8 @@ sealed class WidgetForm : Form
     bool _locked;
     string _anchor = "auto";
     string _newSide = "right";
-    double _staleHours = 24;
+    Point _home = new(-1, -1);   // the spot you chose (persisted); we always return here, and only
+                                 // ever clamp *off* it temporarily to stay visible — never saving that.
     int _tick;
     string _sig = "";
 
@@ -124,6 +125,10 @@ sealed class WidgetForm : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         DoubleBuffered = true;
+        // Fixed-pixel, hand-drawn widget: never let WinForms auto-rescale us when we land on
+        // a different-DPI monitor (PerMonitorV2). We own our size (ContentSize) and react to
+        // DPI/topology changes ourselves in ReconcileDisplay — auto-scaling would fight that.
+        AutoScaleMode = AutoScaleMode.None;
         BackColor = Color.FromArgb(30, 30, 34);   // dark pill; rounded shape comes from Region (no key fringe)
 
         BuildMenu();
@@ -142,6 +147,12 @@ sealed class WidgetForm : Form
         _winEventProc = OnForegroundChanged;
         _winEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
             IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+        // Resolution/topology changes (duplicate toggled, a monitor of a different size or
+        // DPI added/removed) fire this — reconcile so we can never end up off-screen,
+        // wrong-sized, or growing the wrong way. WM_DISPLAYCHANGE/WM_DPICHANGED (WndProc)
+        // cover the cases this doesn't.
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
     }
 
     protected override CreateParams CreateParams
@@ -153,6 +164,16 @@ sealed class WidgetForm : Form
             cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
             return cp;
         }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_DISPLAYCHANGE = 0x007E, WM_DPICHANGED = 0x02E0;
+        base.WndProc(ref m);
+        // Belt-and-suspenders alongside SystemEvents.DisplaySettingsChanged: a resolution
+        // change (WM_DISPLAYCHANGE) or a move to a different-DPI monitor (WM_DPICHANGED, which
+        // PerMonitorV2 delivers) both land here even for this WS_EX_NOACTIVATE tool window.
+        if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DPICHANGED) ReconcileDisplay();
     }
 
     static Bitmap LoadPng(string name)
@@ -248,7 +269,8 @@ sealed class WidgetForm : Form
     {
         Size = ContentSize();
         if (Location.X < 0 || Location.Y < 0) DockDefault();
-        EnsureOnScreen();
+        if (_home.X < 0) _home = Location;   // first run / legacy config with no saved spot
+        EnsureOnScreen();                    // clamp only the live position; _home is the truth
         UpdateRegion();
         Visible = _order.Count > 0 && !ShouldHideForFullscreen();
         Invalidate();
@@ -277,6 +299,7 @@ sealed class WidgetForm : Form
                 // so a locked widget stays exactly where you put it (even over the taskbar).
                 if (anchorRight) Location = new Point(oldRight - want.Width, Location.Y);
                 if (!_locked) ClampX();
+                MarkHome();   // growth kept us where we belong — that new spot is the one to return to
                 UpdateRegion();
             }
             if (!Visible) Visible = true;
@@ -329,16 +352,59 @@ sealed class WidgetForm : Form
         // Centered horizontally, just above the taskbar, on the monitor with the cursor.
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
         Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Bottom - Height - 8);
+        _home = Location;   // an explicit placement — this is now the spot to return to
     }
 
     void EnsureOnScreen()
     {
         // Full monitor bounds so it can sit on the taskbar (we keep it in front via
-        // AssertTopmost); just don't let it wander off the physical screen.
-        var b = Screen.FromPoint(Location).Bounds;
+        // AssertTopmost); just don't let it wander off the physical screen. FromRectangle
+        // picks the monitor holding most of the widget (and the nearest one if its monitor
+        // just vanished), so a removed/duplicated display can't strand it.
+        var b = Screen.FromRectangle(Bounds).Bounds;
         int x = Math.Clamp(Location.X, b.Left, Math.Max(b.Left, b.Right - Width));
         int y = Math.Clamp(Location.Y, b.Top, Math.Max(b.Top, b.Bottom - Height));
         if (x != Location.X || y != Location.Y) Location = new Point(x, y);
+    }
+
+    // Whether the whole widget currently sits within a single connected monitor.
+    bool FullyOnScreen()
+    {
+        foreach (var s in Screen.AllScreens)
+            if (s.Bounds.Contains(Bounds)) return true;
+        return false;
+    }
+
+    // Remember the current spot as home — but only while we're actually on a monitor, so a
+    // temporary off-screen clamp (a monitor briefly gone) never overwrites where you put it.
+    void MarkHome() { if (FullyOnScreen()) _home = Location; }
+
+    void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        // Fires on a background thread; hop to the UI thread before touching the form.
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(new Action(ReconcileDisplay)); } catch { /* handle torn down mid-post */ }
+    }
+
+    void ReconcileDisplay()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            // A resolution / DPI / topology change (duplicate toggled on or off, a monitor of
+            // a different size added or removed) can auto-resize us or leave our coordinates on
+            // a monitor that momentarily changed shape. Restore our own fixed-pixel size and go
+            // back to exactly where you left it — on whichever display that was. We touch the
+            // position only if home no longer fits any monitor, and even then just clamp for
+            // visibility WITHOUT saving, so the moment your layout is back it snaps home.
+            var want = ContentSize();
+            if (Size != want) Size = want;
+            if (_home.X >= 0) Location = _home;
+            EnsureOnScreen();
+            UpdateRegion();
+            Invalidate();
+        }
+        catch { /* never let a display event kill the always-on widget */ }
     }
 
     void ResetPosition()
@@ -367,16 +433,19 @@ sealed class WidgetForm : Form
         try
         {
             Directory.CreateDirectory(SessionsDir);
-            var cutoff = _staleHours > 0 ? DateTime.UtcNow.AddHours(-_staleHours) : DateTime.MinValue;
             foreach (var f in Directory.GetFiles(SessionsDir, "*.meta"))
             {
                 var sid = Path.GetFileNameWithoutExtension(f);
 
-                // Primary prune: a session Claude once registered but has since dropped is
-                // gone — evict its tile within ~1.5s (no 24h wait, no clean /exit needed).
-                // Require a few consecutive misses so a mid-write registry blip can't evict a
-                // live session; gated on _seenInReg so a start-up race (a fresh .meta whose
-                // registry entry hasn't appeared yet) is never mistaken for a dead session.
+                // Liveness is Claude's session registry, full stop: a session Claude once
+                // registered but has since dropped is gone — evict its tile within ~1.5s (no
+                // clean /exit needed, no age timeout). A live session (even idle for days)
+                // stays in the registry, so its tile stays. Require a few consecutive misses
+                // so a mid-write registry blip can't evict a live session; gated on _seenInReg
+                // so a start-up race (a fresh .meta whose registry entry hasn't appeared yet)
+                // is never mistaken for a dead session. When the registry is unavailable
+                // (regUsable false) we never prune — a tile then lingers until the registry
+                // returns (its next tick re-evaluates) or you right-click → Dismiss.
                 if (regUsable && _seenInReg.Contains(sid) && !reg.ContainsKey(sid))
                 {
                     int n = _regMiss.TryGetValue(sid, out var c) ? c + 1 : 1;
@@ -384,15 +453,6 @@ sealed class WidgetForm : Form
                     _regMiss[sid] = n;   // keep rendering the tile until the miss budget is spent
                 }
                 else _regMiss.Remove(sid);
-
-                // Fallback prune: abrupt close where the registry is ALSO unavailable — drop a
-                // tile with no hook event in StaleHours. Self-heals: a live session's next
-                // event recreates the .meta.
-                if (_staleHours > 0 && File.GetLastWriteTimeUtc(f) < cutoff)
-                {
-                    DeleteSessionFiles(sid);
-                    continue;
-                }
 
                 Session s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
                 try
@@ -582,7 +642,7 @@ sealed class WidgetForm : Form
             if (!_moved && _hitKind == Hit.Tile && _dragSid != null) ToggleSession(_dragSid);
             else if (_moved)
             {
-                if (_hitKind == Hit.Grip) EnsureOnScreen();   // snap back out of the taskbar
+                if (_hitKind == Hit.Grip) { EnsureOnScreen(); _home = Location; }   // you moved it — new home
                 SaveConfig();
             }
         }
@@ -672,9 +732,8 @@ sealed class WidgetForm : Form
                     _locked = c.Locked;
                     _anchor = c.Anchor;
                     _newSide = c.NewSide;
-                    _staleHours = c.StaleHours;
                     _order.AddRange(c.Order);
-                    if (c.X >= 0 && c.Y >= 0) Location = new Point(c.X, c.Y);
+                    if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); Location = _home; }
                 }
             }
         }
@@ -689,8 +748,11 @@ sealed class WidgetForm : Form
             Directory.CreateDirectory(HookerDir);
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(new WidgetConfig
             {
-                X = Location.X, Y = Location.Y, Locked = _locked,
-                Anchor = _anchor, NewSide = _newSide, StaleHours = _staleHours, Order = new(_order),
+                // Persist _home, never the live Location — the live one may be a temporary
+                // clamp to stay visible while a monitor is missing, which must not become the
+                // remembered spot.
+                X = _home.X, Y = _home.Y, Locked = _locked,
+                Anchor = _anchor, NewSide = _newSide, Order = new(_order),
             }));
         }
         catch { }
@@ -698,6 +760,7 @@ sealed class WidgetForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
         foreach (var sid in _order)                 // never leave a session auto-approving
             try { File.WriteAllText(Path.Combine(SessionsDir, sid + ".state"), "off"); } catch { }
@@ -709,6 +772,7 @@ sealed class WidgetForm : Form
     {
         if (disposing)
         {
+            SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
             _poll?.Dispose();
             _menu?.Dispose();

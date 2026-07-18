@@ -39,7 +39,11 @@ It stays **in front of the taskbar**, **hides** while a fullscreen app owns the 
 
 ### Stale tiles
 
-A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it (which Claude does even on an abrupt close), its tile is **evicted within ~1.5s**. If the registry is unavailable, it falls back to **auto-pruning** any tile silent for `StaleHours` (default **24h**, `0` disables in `widget.json`). Both self-heal — a live session's next hook event recreates its tile — and right-click → **Dismiss** clears one instantly.
+A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it (which Claude does even on an abrupt close), its tile is **evicted within ~1.5s**. Liveness is driven purely by that registry — a session that's *there* keeps its tile (even if it sits idle for days), and one that's *gone* loses it; there is no age-based timeout. If the registry is ever unavailable, tiles are left in place until it returns (self-healing: a live session's next hook event refreshes its tile) — and right-click → **Dismiss** clears one instantly.
+
+### Multi-monitor & display changes
+
+**Wherever you park it, it stays there** — on any monitor. The widget remembers your chosen spot ("home") and returns to exactly it across display-configuration changes: a monitor added or removed, a **duplicate** toggled on/off, a resolution or DPI change. It's per-monitor DPI-aware and never lets Windows auto-resize it. The *only* time it touches its own position is when home momentarily doesn't fit any connected monitor (e.g. a duplicate dropped your resolution) — then it clamps just enough to stay visible, **without** overwriting home, so the instant your normal layout is back it snaps precisely home. Your spot only ever changes when *you* change it (drag the grip, or right-click → **Reset position**).
 
 ## ⚠️ Security — read this
 
