@@ -688,6 +688,7 @@ sealed class WidgetForm : Form
         _hitKind = Hit.None;
         _dragSid = null;
         _moved = false;
+        Invalidate();   // settle the lifted tile back into its slot the instant you release
         base.OnMouseUp(e);
     }
 
