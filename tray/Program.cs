@@ -108,6 +108,8 @@ sealed class WidgetForm : Form
     string? _dragSid;
     bool _moved;
     Point _downScreen, _downFormLoc;
+    int _dragGrabDX;             // cursor-to-tile-left offset at grab, so a lifted tile tracks under the pointer
+    Point _dragPos;              // current pointer, form coords (only meaningful mid tile-drag)
     string _hoverSid = "", _hoverText = "";
 
     public WidgetForm()
@@ -564,8 +566,42 @@ sealed class WidgetForm : Form
                 for (int cy = 0; cy < 3; cy++)
                     g.FillEllipse(dot, gr.X + 3 + cx * 6, gr.Y + Tile / 2 - 11 + cy * 8, 4, 4);
 
+        bool lifting = _moved && _hitKind == Hit.Tile && _dragSid != null;
+        int liftIdx = lifting ? _order.IndexOf(_dragSid!) : -1;
+
         for (int i = 0; i < _order.Count; i++)
+        {
+            if (i == liftIdx) { DrawEmptySlot(g, TileRect(i)); continue; }  // the hole the held tile left behind
             g.DrawImage(TileFor(_sessions[_order[i]]), TileRect(i));
+        }
+
+        if (lifting) DrawLiftedTile(g, TileFor(_sessions[_dragSid!]));
+    }
+
+    // A recessed slot showing where the held tile will drop.
+    void DrawEmptySlot(Graphics g, Rectangle r)
+    {
+        using var p = Rounded(Rectangle.Inflate(r, -2, -2), Radius - 3);
+        using var fill = new SolidBrush(Color.FromArgb(90, 0, 0, 0));
+        g.FillPath(fill, p);
+        using var edge = new Pen(Color.FromArgb(30, 255, 255, 255));
+        g.DrawPath(edge, p);
+    }
+
+    // The picked-up tile: floats a few px above the strip, tracks the pointer, scaled up a
+    // touch with a soft ground shadow so it reads as lifted off the surface.
+    void DrawLiftedTile(Graphics g, Bitmap img)
+    {
+        const int Lift = 5, Grow = 2;
+        int minX = TileRect(0).X, maxX = TileRect(_order.Count - 1).X;
+        int left = Math.Clamp(_dragPos.X - _dragGrabDX, minX, maxX);
+
+        // Ground shadow, directly under where the tile is being carried.
+        using (var shadow = Rounded(new Rectangle(left + 1, Pad + 4, Tile, Tile - 2), Radius))
+        using (var sb = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+            g.FillPath(sb, shadow);
+
+        g.DrawImage(img, new Rectangle(left - Grow, Pad - Lift - Grow, Tile + Grow * 2, Tile + Grow * 2));
     }
 
     Bitmap TileFor(Session s) =>
@@ -595,6 +631,8 @@ sealed class WidgetForm : Form
         {
             _hitKind = HitTest(e.Location, out int idx);
             _dragSid = _hitKind == Hit.Tile ? _order[idx] : null;
+            _dragGrabDX = _hitKind == Hit.Tile ? e.X - TileRect(idx).X : 0;
+            _dragPos = e.Location;
             _moved = false;
             _downScreen = Cursor.Position;
             _downFormLoc = Location;
@@ -616,13 +654,14 @@ sealed class WidgetForm : Form
                     Location = new Point(_downFormLoc.X + (now.X - _downScreen.X), _downFormLoc.Y + (now.Y - _downScreen.Y));
                 else if (_hitKind == Hit.Tile && _dragSid != null)
                 {
+                    _dragPos = e.Location;
                     int target = SlotFromX(e.X), cur = _order.IndexOf(_dragSid);
                     if (target != cur && target >= 0)
                     {
                         _order.RemoveAt(cur);
                         _order.Insert(target, _dragSid);
-                        Invalidate();
                     }
+                    Invalidate();   // repaint every move so the lifted tile tracks the pointer
                 }
             }
         }
