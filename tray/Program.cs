@@ -70,8 +70,22 @@ sealed class WidgetConfig
 
 sealed class WidgetForm : Form
 {
-    const int Tile = 51, Gap = 7, Grip = 16, Pad = 7, Radius = 12, DragThreshold = 5;
+    // Sizes were hand-tuned on the author's 4K @ 200% console (192 dpi). To hold a constant
+    // apparent size elsewhere — notably a lower-DPI Remote Desktop session, where fixed raw
+    // pixels ballooned relative to that session's 100% UI — every size scales by
+    // DeviceDpi/RefDpi. On the 200% console the factor is exactly 1, so the widget stays
+    // pixel-identical to how it was tuned; a 100% RDP view renders at half.
+    const int RefDpi = 192;
+    const int BaseTile = 51, BaseGap = 7, BaseGrip = 16, BasePad = 7, BaseRadius = 12, DragThreshold = 5;
     const int RegMissesToPrune = 15;   // ticks a session may be registry-absent (poll=100ms => ~1.5s) before its tile is evicted
+
+    double _scale = 1.0;               // DeviceDpi / RefDpi; refreshed on DPI/display changes
+    int Sc(int v) => (int)Math.Round(v * _scale);
+    int Tile => Sc(BaseTile);
+    int Gap => Sc(BaseGap);
+    int Grip => Sc(BaseGrip);
+    int Pad => Sc(BasePad);
+    int Radius => Sc(BaseRadius);
 
     static readonly string HookerDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "hooker");
@@ -136,6 +150,7 @@ sealed class WidgetForm : Form
         BuildMenu();
         LoadConfig();
         _ = Handle;                          // create handle so the timer pumps while hidden
+        UpdateScale();                       // adopt the starting monitor's DPI before first layout
 
         SyncSessions();
         InitialLayout();
@@ -388,11 +403,20 @@ sealed class WidgetForm : Form
         try { BeginInvoke(new Action(ReconcileDisplay)); } catch { /* handle torn down mid-post */ }
     }
 
+    // Adopt the current monitor's DPI (PerMonitorV2 keeps DeviceDpi live across monitor
+    // moves and WM_DPICHANGED), expressed relative to the 200% console the sizes were tuned on.
+    void UpdateScale()
+    {
+        double s = (double)DeviceDpi / RefDpi;
+        _scale = s > 0 ? s : 1.0;
+    }
+
     void ReconcileDisplay()
     {
         if (IsDisposed || !IsHandleCreated) return;
         try
         {
+            UpdateScale();   // a DPI change lands here (WndProc) as well as topology changes
             // A resolution / DPI / topology change (duplicate toggled on or off, a monitor of
             // a different size added or removed) can auto-resize us or leave our coordinates on
             // a monitor that momentarily changed shape. Restore our own fixed-pixel size and go
@@ -564,7 +588,7 @@ sealed class WidgetForm : Form
         using (var dot = new SolidBrush(Color.FromArgb(_locked ? 70 : 150, 200, 200, 205)))
             for (int cx = 0; cx < 2; cx++)
                 for (int cy = 0; cy < 3; cy++)
-                    g.FillEllipse(dot, gr.X + 3 + cx * 6, gr.Y + Tile / 2 - 11 + cy * 8, 4, 4);
+                    g.FillEllipse(dot, gr.X + Sc(3) + cx * Sc(6), gr.Y + Tile / 2 - Sc(11) + cy * Sc(8), Sc(4), Sc(4));
 
         bool lifting = _moved && _hitKind == Hit.Tile && _dragSid != null;
         int liftIdx = lifting ? _order.IndexOf(_dragSid!) : -1;
@@ -581,7 +605,7 @@ sealed class WidgetForm : Form
     // A recessed slot showing where the held tile will drop.
     void DrawEmptySlot(Graphics g, Rectangle r)
     {
-        using var p = Rounded(Rectangle.Inflate(r, -2, -2), Radius - 3);
+        using var p = Rounded(Rectangle.Inflate(r, -Sc(2), -Sc(2)), Radius - Sc(3));
         using var fill = new SolidBrush(Color.FromArgb(90, 0, 0, 0));
         g.FillPath(fill, p);
         using var edge = new Pen(Color.FromArgb(30, 255, 255, 255));
@@ -592,12 +616,12 @@ sealed class WidgetForm : Form
     // touch with a soft ground shadow so it reads as lifted off the surface.
     void DrawLiftedTile(Graphics g, Bitmap img)
     {
-        const int Lift = 5, Grow = 2;
+        int Lift = Sc(5), Grow = Sc(2);
         int minX = TileRect(0).X, maxX = TileRect(_order.Count - 1).X;
         int left = Math.Clamp(_dragPos.X - _dragGrabDX, minX, maxX);
 
         // Ground shadow, directly under where the tile is being carried.
-        using (var shadow = Rounded(new Rectangle(left + 1, Pad + 4, Tile, Tile - 2), Radius))
+        using (var shadow = Rounded(new Rectangle(left + Sc(1), Pad + Sc(4), Tile, Tile - Sc(2)), Radius))
         using (var sb = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
             g.FillPath(sb, shadow);
 
@@ -645,7 +669,7 @@ sealed class WidgetForm : Form
         if (e.Button == MouseButtons.Left && _hitKind != Hit.None)
         {
             var now = Cursor.Position;
-            if (!_moved && (Math.Abs(now.X - _downScreen.X) > DragThreshold || Math.Abs(now.Y - _downScreen.Y) > DragThreshold))
+            if (!_moved && (Math.Abs(now.X - _downScreen.X) > Sc(DragThreshold) || Math.Abs(now.Y - _downScreen.Y) > Sc(DragThreshold)))
                 _moved = true;
 
             if (_moved)
