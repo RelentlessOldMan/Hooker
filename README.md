@@ -127,3 +127,7 @@ Hooker/
   dist/                   built exes + settings-hooks-snippet.json
   build.ps1  install-hook.ps1  uninstall-hook.ps1  "Install Hooker.cmd"
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). © 2026 RelentlessOldMan.
