@@ -12,3 +12,4 @@ __pycache__/
 # release artifacts
 release-tmp/
 *.zip
+SHA256SUMS.txt
