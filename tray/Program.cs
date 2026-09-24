@@ -116,6 +116,7 @@ sealed class WidgetForm : Form
                                  // ever clamp *off* it temporarily to stay visible — never saving that.
     int _tick;
     string _sig = "";
+    string _screenSig = "";   // monitor layout + DPI; a change means a topology/resolution/RDP switch
 
     enum Hit { None, Grip, Tile }
     Hit _hitKind;
@@ -289,6 +290,7 @@ sealed class WidgetForm : Form
         if (_home.X < 0) _home = Location;   // first run / legacy config with no saved spot
         EnsureOnScreen();                    // clamp only the live position; _home is the truth
         UpdateRegion();
+        _screenSig = ScreenSig();            // baseline; Tick reconciles when this later changes
         Visible = _order.Count > 0 && !ShouldHideForFullscreen();
         Invalidate();
     }
@@ -298,6 +300,13 @@ sealed class WidgetForm : Form
         try
         {
             SyncSessions();
+
+            // Poll the display topology: RDP connect/disconnect and resolution changes don't
+            // reliably deliver WM_DISPLAYCHANGE/DisplaySettingsChanged to this always-on tool
+            // window, so the event-driven ReconcileDisplay can miss them and leave us stranded
+            // where the *other* screen put us. Catching the change here snaps us back to _home.
+            var scr = ScreenSig();
+            if (scr != _screenSig) { _screenSig = scr; ReconcileDisplay(); }
 
             if (ShouldHideForFullscreen() || _order.Count == 0)
             {
@@ -393,9 +402,37 @@ sealed class WidgetForm : Form
         return false;
     }
 
-    // Remember the current spot as home — but only while we're actually on a monitor, so a
-    // temporary off-screen clamp (a monitor briefly gone) never overwrites where you put it.
-    void MarkHome() { if (FullyOnScreen()) _home = Location; }
+    // Whether the saved home spot fits some current monitor. When it doesn't, home was picked
+    // on a bigger/other screen (e.g. your local 4K) and we're currently on a smaller foreign
+    // one (a Remote Desktop session), so the live position is just a visibility clamp — not a
+    // spot to adopt as home.
+    bool HomeFitsSomeScreen()
+    {
+        var r = new Rectangle(_home, Size);
+        foreach (var s in Screen.AllScreens)
+            if (s.Bounds.Contains(r)) return true;
+        return false;
+    }
+
+    // A fingerprint of the monitor layout + current DPI; changes on a resolution change, a
+    // monitor added/removed/duplicated, or an RDP session swap.
+    string ScreenSig()
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var s in Screen.AllScreens)
+        {
+            var b = s.Bounds;
+            sb.Append(b.X).Append(',').Append(b.Y).Append(',').Append(b.Width).Append('x').Append(b.Height).Append(';');
+        }
+        uint dpi = 0; try { if (IsHandleCreated) dpi = GetDpiForWindow(Handle); } catch { }
+        return sb.Append('@').Append(dpi).ToString();
+    }
+
+    // Remember the current spot as home — but only while we're actually resting on the monitor
+    // home belongs to. A temporary off-screen clamp (a monitor briefly gone, or a smaller RDP
+    // screen) must never overwrite where you put it, or the widget gets stranded mid-screen when
+    // you return to your real display.
+    void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) _home = Location; }
 
     void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
@@ -437,6 +474,7 @@ sealed class WidgetForm : Form
             EnsureOnScreen();
             UpdateRegion();
             Invalidate();
+            _screenSig = ScreenSig();   // event beat the poll to it; don't reconcile again next tick
         }
         catch { /* never let a display event kill the always-on widget */ }
     }
