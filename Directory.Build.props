@@ -1,0 +1,21 @@
+<Project>
+
+  <!--
+    Single source of truth for the product version is the repo-root VERSION file.
+    The build only READS it here; it never writes or bumps it. So anyone who clones
+    and builds gets exactly the version we committed, with no flags and no scripts.
+
+    Bump the version deliberately, only when features change: edit VERSION and commit
+    "Release vX.Y.Z". A plain build must never change it.
+
+    (VERSION must stay a plain numeric M.M.P so it is valid for AssemblyVersion.)
+  -->
+  <PropertyGroup>
+    <_VersionFile>$(MSBuildThisFileDirectory)VERSION</_VersionFile>
+    <_VersionRaw Condition="Exists('$(_VersionFile)')">$([System.IO.File]::ReadAllText('$(_VersionFile)'))</_VersionRaw>
+    <Version Condition="'$(_VersionRaw)' != ''">$(_VersionRaw.Trim())</Version>
+    <AssemblyVersion Condition="'$(Version)' != ''">$(Version)</AssemblyVersion>
+    <FileVersion Condition="'$(Version)' != ''">$(Version)</FileVersion>
+  </PropertyGroup>
+
+</Project>
