@@ -305,6 +305,7 @@ sealed class WidgetForm : Form
                 return;
             }
 
+            UpdateScale();   // live DPI, so an RDP connect/disconnect resizes us within a tick
             var want = ContentSize();
             if (want != Size)
             {
@@ -403,11 +404,18 @@ sealed class WidgetForm : Form
         try { BeginInvoke(new Action(ReconcileDisplay)); } catch { /* handle torn down mid-post */ }
     }
 
-    // Adopt the current monitor's DPI (PerMonitorV2 keeps DeviceDpi live across monitor
-    // moves and WM_DPICHANGED), expressed relative to the 200% console the sizes were tuned on.
+    // Adopt the current monitor's DPI, expressed relative to the 200% console the sizes were
+    // tuned on. We query GetDpiForWindow live rather than trusting Form.DeviceDpi: DeviceDpi is
+    // cached at launch and does NOT reliably refresh when Remote Desktop swaps the session DPI
+    // (no WM_DPICHANGED reaches this always-on tool window), which left the widget drawing at the
+    // console's 192 dpi — double size — inside a 96-dpi RDP session. Called every tick so it
+    // self-heals across connect/disconnect even if no display event fires.
     void UpdateScale()
     {
-        double s = (double)DeviceDpi / RefDpi;
+        uint dpi = 0;
+        try { if (IsHandleCreated) dpi = GetDpiForWindow(Handle); } catch { }
+        if (dpi == 0) dpi = (uint)DeviceDpi;   // fallback if the API is unavailable
+        double s = (double)dpi / RefDpi;
         _scale = s > 0 ? s : 1.0;
     }
 
@@ -864,6 +872,7 @@ sealed class WidgetForm : Form
         if (Visible && !ShouldHideForFullscreen()) AssertTopmost();
     }
 
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
