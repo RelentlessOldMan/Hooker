@@ -61,12 +61,24 @@ try
     var metaPath = Path.Combine(sessionsDir, sid + ".meta");
     var statePath = Path.Combine(sessionsDir, sid + ".state");
 
+    // Read allowing the widget (or another shim) to hold the file open — a plain File.ReadAllText
+    // denies writers, so a concurrent rename/write would throw and we'd lose the read.
+    static string? ReadShared(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            return sr.ReadToEnd();
+        }
+        catch { return null; }
+    }
     Meta ReadMeta()
     {
         try
         {
-            if (File.Exists(metaPath))
-                return JsonSerializer.Deserialize<Meta>(File.ReadAllText(metaPath)) ?? new Meta();
+            var t = ReadShared(metaPath);
+            if (t != null) return JsonSerializer.Deserialize<Meta>(t) ?? new Meta();
         }
         catch { }
         return new Meta();
@@ -76,10 +88,16 @@ try
         try
         {
             Directory.CreateDirectory(sessionsDir);
-            // Write-then-rename so the widget never reads a half-written .meta.
-            var tmp = metaPath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(m));
-            File.Move(tmp, metaPath, overwrite: true);
+            // Write-then-rename so the widget never reads a half-written .meta. The temp name is
+            // per-process so two shim invocations for the SAME session (Claude can fire tools in
+            // parallel) can't write the same tmp and corrupt it; the finally clears a lost tmp.
+            var tmp = metaPath + "." + Environment.ProcessId + ".tmp";
+            try
+            {
+                File.WriteAllText(tmp, JsonSerializer.Serialize(m));
+                File.Move(tmp, metaPath, overwrite: true);
+            }
+            finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
         }
         catch { }
     }
@@ -93,12 +111,8 @@ try
     }
     bool Hooking()
     {
-        try
-        {
-            return File.Exists(statePath) &&
-                   File.ReadAllText(statePath).Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
-        }
-        catch { return false; }
+        var t = ReadShared(statePath);
+        return t != null && t.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
     switch (evt)

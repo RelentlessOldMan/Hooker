@@ -152,6 +152,7 @@ sealed class WidgetForm : Form
         LoadConfig();
         _ = Handle;                          // create handle so the timer pumps while hidden
         UpdateScale();                       // adopt the starting monitor's DPI before first layout
+        try { Directory.CreateDirectory(SessionsDir); } catch { }   // once, not every tick
 
         SyncSessions();
         InitialLayout();
@@ -306,7 +307,9 @@ sealed class WidgetForm : Form
             // window, so the event-driven ReconcileDisplay can miss them and leave us stranded
             // where the *other* screen put us. Catching the change here snaps us back to _home.
             var scr = ScreenSig();
-            if (scr != _screenSig) { _screenSig = scr; ReconcileDisplay(); }
+            // Defer while dragging: don't consume the change (leave _screenSig stale) so the next
+            // idle tick reconciles once the drag ends, instead of snapping home mid-drag.
+            if (scr != _screenSig && !_moved) { _screenSig = scr; ReconcileDisplay(); }
 
             if (ShouldHideForFullscreen() || _order.Count == 0)
             {
@@ -344,7 +347,7 @@ sealed class WidgetForm : Form
         var sb = new System.Text.StringBuilder(_order.Count * 40);
         foreach (var sid in _order)
         {
-            var s = _sessions[sid];
+            if (!_sessions.TryGetValue(sid, out var s)) continue;
             sb.Append(sid).Append(s.Working ? '1' : '0').Append(s.Hooking ? '1' : '0').Append('|');
         }
         return sb.ToString();
@@ -459,6 +462,7 @@ sealed class WidgetForm : Form
     void ReconcileDisplay()
     {
         if (IsDisposed || !IsHandleCreated) return;
+        if (_moved) return;   // never yank position to _home out from under an in-progress drag
         try
         {
             UpdateScale();   // a DPI change lands here (WndProc) as well as topology changes
@@ -492,6 +496,33 @@ sealed class WidgetForm : Form
 
     // ---- data sync -------------------------------------------------------
 
+    // Read allowing a concurrent writer (the shim renames .meta and we write .state): a plain
+    // File.ReadAllText denies writers, which would block the shim's atomic rename and drop the
+    // update. Returns null on any failure (missing/locked/torn) so callers keep prior state.
+    static string? ReadShared(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            return sr.ReadToEnd();
+        }
+        catch { return null; }
+    }
+
+    // Write-then-rename so a concurrent shim never reads a half-written .state (which drives
+    // auto-approve). Per-process temp name so parallel writers can't clobber each other's tmp.
+    static void WriteAtomic(string path, string content)
+    {
+        var tmp = path + "." + Environment.ProcessId + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, content);
+            File.Move(tmp, path, overwrite: true);
+        }
+        finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+    }
+
     void SyncSessions()
     {
         // Claude's per-session registry (files named by PID) is our liveness signal: Claude
@@ -504,7 +535,6 @@ sealed class WidgetForm : Form
         List<string> live = new();
         try
         {
-            Directory.CreateDirectory(SessionsDir);
             foreach (var f in Directory.GetFiles(SessionsDir, "*.meta"))
             {
                 var sid = Path.GetFileNameWithoutExtension(f);
@@ -529,13 +559,13 @@ sealed class WidgetForm : Form
                 Session s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
                 try
                 {
-                    var m = JsonSerializer.Deserialize<MetaDto>(File.ReadAllText(f));
-                    if (m != null) { s.Status = m.status; s.Cwd = m.cwd; s.Count = m.count; }
+                    var text = ReadShared(f);
+                    var m = text != null ? JsonSerializer.Deserialize<MetaDto>(text) : null;
+                    if (m != null) { s.Status = m.status; s.Cwd = m.cwd; s.Count = Math.Max(0, m.count); }
                 }
                 catch { }
-                var statePath = Path.Combine(SessionsDir, sid + ".state");
-                try { s.Hooking = File.Exists(statePath) && File.ReadAllText(statePath).Trim().Equals("on", StringComparison.OrdinalIgnoreCase); }
-                catch { }
+                var st = ReadShared(Path.Combine(SessionsDir, sid + ".state"));
+                s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
                 _sessions[sid] = s;
                 live.Add(sid);
             }
@@ -578,7 +608,9 @@ sealed class WidgetForm : Form
             {
                 try
                 {
-                    using var doc = JsonDocument.Parse(File.ReadAllText(f));
+                    var text = ReadShared(f);   // Claude may be mid-write; don't block or throw
+                    if (text == null) continue;
+                    using var doc = JsonDocument.Parse(text);
                     var r = doc.RootElement;
                     if (!r.TryGetProperty("sessionId", out var sidEl)) continue;
                     var sid = sidEl.GetString();
@@ -617,7 +649,8 @@ sealed class WidgetForm : Form
     }
 
     int SlotFromX(int x) =>
-        Math.Clamp((int)Math.Round((x - (Pad + Grip + Gap)) / (double)(Tile + Gap)), 0, _order.Count - 1);
+        _order.Count == 0 ? -1   // Math.Clamp(_, 0, -1) would throw; no slots to target anyway
+            : Math.Clamp((int)Math.Round((x - (Pad + Grip + Gap)) / (double)(Tile + Gap)), 0, _order.Count - 1);
 
     // ---- painting --------------------------------------------------------
 
@@ -642,10 +675,12 @@ sealed class WidgetForm : Form
         for (int i = 0; i < _order.Count; i++)
         {
             if (i == liftIdx) { DrawEmptySlot(g, TileRect(i)); continue; }  // the hole the held tile left behind
-            g.DrawImage(TileFor(_sessions[_order[i]]), TileRect(i));
+            // TryGetValue, not indexer: OnPaint runs OUTSIDE Tick's try/catch, so a transient
+            // _order/_sessions desync must skip a tile, never throw and wedge painting.
+            if (_sessions.TryGetValue(_order[i], out var s)) g.DrawImage(TileFor(s), TileRect(i));
         }
 
-        if (lifting) DrawLiftedTile(g, TileFor(_sessions[_dragSid!]));
+        if (lifting && _sessions.TryGetValue(_dragSid!, out var ds)) DrawLiftedTile(g, TileFor(ds));
     }
 
     // A recessed slot showing where the held tile will drop.
@@ -662,6 +697,7 @@ sealed class WidgetForm : Form
     // touch with a soft ground shadow so it reads as lifted off the surface.
     void DrawLiftedTile(Graphics g, Bitmap img)
     {
+        if (_order.Count == 0) return;   // TileRect(-1) would be garbage; nothing to carry
         int Lift = Sc(5), Grow = Sc(2);
         int minX = TileRect(0).X, maxX = TileRect(_order.Count - 1).X;
         int left = Math.Clamp(_dragPos.X - _dragGrabDX, minX, maxX);
@@ -795,7 +831,7 @@ sealed class WidgetForm : Form
         try
         {
             Directory.CreateDirectory(SessionsDir);
-            File.WriteAllText(Path.Combine(SessionsDir, sid + ".state"), s.Hooking ? "on" : "off");
+            WriteAtomic(Path.Combine(SessionsDir, sid + ".state"), s.Hooking ? "on" : "off");
         }
         catch { }
         Invalidate();
@@ -822,8 +858,14 @@ sealed class WidgetForm : Form
             var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
             if (!GetMonitorInfo(fgMon, ref mi)) return false;
 
-            return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
-                   wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+            bool coversMonitor = wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
+                                 wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+            if (!coversMonitor) return false;
+
+            // A maximized ordinary window also covers the whole monitor when the taskbar is
+            // auto-hidden. Only treat it as fullscreen if it has no title bar (a game or
+            // borderless app), so the widget doesn't vanish while you work maximized.
+            return (GetWindowLong(fg, GWL_STYLE) & WS_CAPTION) == 0;
         }
         catch { return false; }
     }
@@ -839,10 +881,13 @@ sealed class WidgetForm : Form
                 var c = JsonSerializer.Deserialize<WidgetConfig>(File.ReadAllText(ConfigPath));
                 if (c != null)
                 {
+                    // Coerce hand-edited / corrupt values to valid ones, and drop null/blank or
+                    // duplicate sids, so a bad widget.json can't wedge the menu or double a tile.
                     _locked = c.Locked;
-                    _anchor = c.Anchor;
-                    _newSide = c.NewSide;
-                    _order.AddRange(c.Order);
+                    _anchor = c.Anchor is "left" or "right" or "auto" ? c.Anchor : "auto";
+                    _newSide = c.NewSide is "left" or "right" ? c.NewSide : "right";
+                    foreach (var sid in c.Order ?? new List<string>())
+                        if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
                     if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); Location = _home; }
                 }
             }
@@ -873,7 +918,7 @@ sealed class WidgetForm : Form
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
         foreach (var sid in _order)                 // never leave a session auto-approving
-            try { File.WriteAllText(Path.Combine(SessionsDir, sid + ".state"), "off"); } catch { }
+            try { WriteAtomic(Path.Combine(SessionsDir, sid + ".state"), "off"); } catch { }
         SaveConfig();
         base.OnFormClosing(e);
     }
@@ -895,6 +940,8 @@ sealed class WidgetForm : Form
     // ---- Win32 -----------------------------------------------------------
 
     const uint MONITOR_DEFAULTTONEAREST = 2;
+    const int GWL_STYLE = -16;
+    const int WS_CAPTION = 0x00C00000;
     static readonly IntPtr HWND_TOPMOST = new(-1);
     const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003, WINEVENT_OUTOFCONTEXT = 0x0000;
@@ -907,10 +954,15 @@ sealed class WidgetForm : Form
 
     void OnForegroundChanged(IntPtr hook, uint evt, IntPtr hwnd, int obj, int child, uint thread, uint time)
     {
-        if (Visible && !ShouldHideForFullscreen()) AssertTopmost();
+        // An OUTOFCONTEXT event already queued before UnhookWinEvent can still dispatch during
+        // teardown; guard + swallow so touching a disposing form never throws (this callback,
+        // unlike Tick, has no outer safety net).
+        if (IsDisposed || !IsHandleCreated) return;
+        try { if (Visible && !ShouldHideForFullscreen()) AssertTopmost(); } catch { }
     }
 
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int nIndex);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
