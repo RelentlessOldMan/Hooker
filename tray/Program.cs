@@ -63,9 +63,17 @@ sealed class WidgetConfig
     public int X { get; set; } = -1;
     public int Y { get; set; } = -1;
     public bool Locked { get; set; }
-    public string Anchor { get; set; } = "auto";   // auto | left | right
+    public string Anchor { get; set; } = "auto";   // auto | left | right  (grow direction)
     public string NewSide { get; set; } = "right";  // right | left
     public List<string> Order { get; set; } = new();
+
+    // Home as an edge-relative spec so it can be reproduced on a different-size/DPI screen (a
+    // smaller RDP session) instead of hard-clamping to the edge. GapX/GapY are logical px from
+    // the anchored corner; -1 = unset (legacy config, derived on first run on the home screen).
+    public bool HomeRight { get; set; }
+    public bool HomeBottom { get; set; } = true;
+    public double HomeGapX { get; set; } = -1;
+    public double HomeGapY { get; set; } = -1;
 }
 
 sealed class WidgetForm : Form
@@ -114,6 +122,9 @@ sealed class WidgetForm : Form
     string _newSide = "right";
     Point _home = new(-1, -1);   // the spot you chose (persisted); we always return here, and only
                                  // ever clamp *off* it temporarily to stay visible — never saving that.
+    bool _relValid;              // edge-relative spec of _home captured (which corner + logical gap)
+    bool _relRight, _relBottom = true;
+    double _relGapX, _relGapY;
     int _tick;
     string _sig = "";
     string _screenSig = "";   // monitor layout + DPI; a change means a topology/resolution/RDP switch
@@ -290,6 +301,7 @@ sealed class WidgetForm : Form
         if (Location.X < 0 || Location.Y < 0) DockDefault();
         if (_home.X < 0) _home = Location;   // first run / legacy config with no saved spot
         EnsureOnScreen();                    // clamp only the live position; _home is the truth
+        if (HomeFitsSomeScreen()) ComputeRel();   // capture/refresh the edge-relative spec (also migrates legacy configs)
         UpdateRegion();
         _screenSig = ScreenSig();            // baseline; Tick reconciles when this later changes
         Visible = _order.Count > 0 && !ShouldHideForFullscreen();
@@ -383,6 +395,7 @@ sealed class WidgetForm : Form
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
         Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Bottom - Height - 8);
         _home = Location;   // an explicit placement — this is now the spot to return to
+        ComputeRel();
     }
 
     void EnsureOnScreen()
@@ -435,7 +448,34 @@ sealed class WidgetForm : Form
     // home belongs to. A temporary off-screen clamp (a monitor briefly gone, or a smaller RDP
     // screen) must never overwrite where you put it, or the widget gets stranded mid-screen when
     // you return to your real display.
-    void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) _home = Location; }
+    void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) { _home = Location; ComputeRel(); } }
+
+    // Capture _home as an edge-relative spec: which corner it hugs, and the logical (DPI-normalized)
+    // gap to that corner. This lets the exact spot be reproduced on a different-size/DPI screen
+    // (e.g. a smaller RDP session) instead of being hard-clamped to the edge. Only meaningful while
+    // _home sits on a real monitor.
+    void ComputeRel()
+    {
+        if (_home.X < 0) return;
+        var b = Screen.FromRectangle(new Rectangle(_home, Size)).Bounds;
+        _relRight  = _home.X + Width / 2 >= b.Left + b.Width / 2;
+        _relBottom = _home.Y + Height / 2 >= b.Top + b.Height / 2;
+        _relGapX = (_relRight  ? b.Right  - (_home.X + Width)  : _home.X - b.Left) / _scale;
+        _relGapY = (_relBottom ? b.Bottom - (_home.Y + Height) : _home.Y - b.Top ) / _scale;
+        _relValid = true;
+    }
+
+    // Reproduce the parked spot on the current monitor from the edge-relative spec, scaling the gap
+    // to the current DPI. Used only when _home itself doesn't fit (a smaller/foreign screen), so we
+    // keep the same corner + gap (e.g. left of the tray) rather than slamming against the edge.
+    Point HomeFromRel()
+    {
+        var b = Screen.FromRectangle(new Rectangle(_home, Size)).Bounds;
+        int gx = (int)Math.Round(_relGapX * _scale), gy = (int)Math.Round(_relGapY * _scale);
+        int x = _relRight  ? b.Right  - Width  - gx : b.Left + gx;
+        int y = _relBottom ? b.Bottom - Height - gy : b.Top  + gy;
+        return new Point(x, y);
+    }
 
     void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
@@ -474,7 +514,11 @@ sealed class WidgetForm : Form
             // visibility WITHOUT saving, so the moment your layout is back it snaps home.
             var want = ContentSize();
             if (Size != want) Size = want;
-            if (_home.X >= 0) Location = _home;
+            // On home's own screen, snap to the exact spot. On a smaller/foreign screen where home
+            // no longer fits, reproduce the same corner + gap (left of the tray) instead of letting
+            // EnsureOnScreen hard-clamp it against the edge.
+            if (_home.X >= 0)
+                Location = (!HomeFitsSomeScreen() && _relValid) ? HomeFromRel() : _home;
             EnsureOnScreen();
             UpdateRegion();
             Invalidate();
@@ -787,7 +831,7 @@ sealed class WidgetForm : Form
             if (!_moved && _hitKind == Hit.Tile && _dragSid != null) ToggleSession(_dragSid);
             else if (_moved)
             {
-                if (_hitKind == Hit.Grip) { EnsureOnScreen(); _home = Location; }   // you moved it — new home
+                if (_hitKind == Hit.Grip) { EnsureOnScreen(); _home = Location; ComputeRel(); }   // you moved it — new home
                 SaveConfig();
             }
         }
@@ -889,6 +933,9 @@ sealed class WidgetForm : Form
                     foreach (var sid in c.Order ?? new List<string>())
                         if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
                     if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); Location = _home; }
+                    _relRight = c.HomeRight; _relBottom = c.HomeBottom;
+                    _relGapX = c.HomeGapX; _relGapY = c.HomeGapY;
+                    _relValid = c.HomeGapX >= 0 && c.HomeGapY >= 0;
                 }
             }
         }
@@ -908,6 +955,8 @@ sealed class WidgetForm : Form
                 // remembered spot.
                 X = _home.X, Y = _home.Y, Locked = _locked,
                 Anchor = _anchor, NewSide = _newSide, Order = new(_order),
+                HomeRight = _relRight, HomeBottom = _relBottom,
+                HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,
             }));
         }
         catch { }
