@@ -129,6 +129,11 @@ sealed class WidgetForm : Form
     string _sig = "";
     string _screenSig = "";   // monitor layout + DPI; a change means a topology/resolution/RDP switch
 
+    // In-memory diagnostic ring buffer (no disk writes until you right-click -> Save debug log).
+    // Captures startup + every display/DPI/topology change — the data needed to debug positioning.
+    const int LogCap = 400;
+    readonly Queue<string> _log = new();
+
     enum Hit { None, Grip, Tile }
     Hit _hitKind;
     string? _dragSid;
@@ -183,6 +188,8 @@ sealed class WidgetForm : Form
         // wrong-sized, or growing the wrong way. WM_DISPLAYCHANGE/WM_DPICHANGED (WndProc)
         // cover the cases this doesn't.
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+
+        Log($"START {_version} refDpi={RefDpi} :: {StateSnapshot()}");
     }
 
     protected override CreateParams CreateParams
@@ -203,7 +210,8 @@ sealed class WidgetForm : Form
         // Belt-and-suspenders alongside SystemEvents.DisplaySettingsChanged: a resolution
         // change (WM_DISPLAYCHANGE) or a move to a different-DPI monitor (WM_DPICHANGED, which
         // PerMonitorV2 delivers) both land here even for this WS_EX_NOACTIVATE tool window.
-        if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DPICHANGED) ReconcileDisplay();
+        if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DPICHANGED)
+            ReconcileDisplay(m.Msg == WM_DPICHANGED ? "wm_dpichanged" : "wm_displaychange");
     }
 
     static Bitmap LoadPng(string name)
@@ -250,6 +258,7 @@ sealed class WidgetForm : Form
         _menu.Items.Add(_anchorMenu);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Reset position", null, (_, _) => ResetPosition()));
+        _menu.Items.Add(new ToolStripMenuItem("Save debug log", null, (_, _) => SaveDebugLog()));
         _menu.Items.Add(_exitItem);
         SetForegroundWindow(Handle);   // lets the menu dismiss on ANY outside click, not just the grip
         _menu.Show(this, p);
@@ -321,7 +330,7 @@ sealed class WidgetForm : Form
             var scr = ScreenSig();
             // Defer while dragging: don't consume the change (leave _screenSig stale) so the next
             // idle tick reconciles once the drag ends, instead of snapping home mid-drag.
-            if (scr != _screenSig && !_moved) { _screenSig = scr; ReconcileDisplay(); }
+            if (scr != _screenSig && !_moved) { _screenSig = scr; ReconcileDisplay("topology-poll"); }
 
             if (ShouldHideForFullscreen() || _order.Count == 0)
             {
@@ -481,7 +490,7 @@ sealed class WidgetForm : Form
     {
         // Fires on a background thread; hop to the UI thread before touching the form.
         if (IsDisposed || !IsHandleCreated) return;
-        try { BeginInvoke(new Action(ReconcileDisplay)); } catch { /* handle torn down mid-post */ }
+        try { BeginInvoke(new Action(() => ReconcileDisplay("settings-changed"))); } catch { /* handle torn down mid-post */ }
     }
 
     // Adopt the current monitor's DPI, expressed relative to the 200% console the sizes were
@@ -499,12 +508,13 @@ sealed class WidgetForm : Form
         _scale = s > 0 ? s : 1.0;
     }
 
-    void ReconcileDisplay()
+    void ReconcileDisplay(string reason = "event")
     {
         if (IsDisposed || !IsHandleCreated) return;
-        if (_moved) return;   // never yank position to _home out from under an in-progress drag
+        if (_moved) { Log($"reconcile({reason}) skipped: drag in progress"); return; }   // never yank mid-drag
         try
         {
+            Log($"reconcile({reason}) before :: {StateSnapshot()}");
             UpdateScale();   // a DPI change lands here (WndProc) as well as topology changes
             // A resolution / DPI / topology change (duplicate toggled on or off, a monitor of
             // a different size added or removed) can auto-resize us or leave our coordinates on
@@ -517,14 +527,16 @@ sealed class WidgetForm : Form
             // On home's own screen, snap to the exact spot. On a smaller/foreign screen where home
             // no longer fits, reproduce the same corner + gap (left of the tray) instead of letting
             // EnsureOnScreen hard-clamp it against the edge.
+            bool usedRel = _home.X >= 0 && !HomeFitsSomeScreen() && _relValid;
             if (_home.X >= 0)
-                Location = (!HomeFitsSomeScreen() && _relValid) ? HomeFromRel() : _home;
+                Location = usedRel ? HomeFromRel() : _home;
             EnsureOnScreen();
             UpdateRegion();
             Invalidate();
             _screenSig = ScreenSig();   // event beat the poll to it; don't reconcile again next tick
+            Log($"reconcile({reason}) after usedRel={usedRel} :: {StateSnapshot()}");
         }
-        catch { /* never let a display event kill the always-on widget */ }
+        catch (Exception ex) { Log($"reconcile({reason}) EXCEPTION: {ex}"); /* never let a display event kill the widget */ }
     }
 
     void ResetPosition()
@@ -912,6 +924,51 @@ sealed class WidgetForm : Form
             return (GetWindowLong(fg, GWL_STYLE) & WS_CAPTION) == 0;
         }
         catch { return false; }
+    }
+
+    // ---- diagnostics -----------------------------------------------------
+
+    // Append a timestamped line to the in-memory ring buffer (bounded, never touches disk).
+    void Log(string msg)
+    {
+        try
+        {
+            _log.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {msg}");
+            while (_log.Count > LogCap) _log.Dequeue();
+        }
+        catch { }
+    }
+
+    uint SafeDpi() { try { return IsHandleCreated ? GetDpiForWindow(Handle) : 0; } catch { return 0; } }
+
+    // One-line snapshot of everything relevant to sizing/positioning across a display change.
+    string StateSnapshot()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"dpi={SafeDpi()} scale={_scale:0.###} loc={Location.X},{Location.Y} size={Size.Width}x{Size.Height} ");
+        sb.Append($"home={_home.X},{_home.Y} homeFits={HomeFitsSomeScreen()} ");
+        sb.Append($"rel[valid={_relValid} right={_relRight} bottom={_relBottom} gapX={_relGapX:0.#} gapY={_relGapY:0.#}] ");
+        sb.Append($"locked={_locked} anchor={_anchor} newSide={_newSide} tiles={_order.Count} screens=");
+        foreach (var s in Screen.AllScreens)
+        {
+            var b = s.Bounds;
+            sb.Append($"[{b.X},{b.Y} {b.Width}x{b.Height}{(s.Primary ? "*" : "")}]");
+        }
+        return sb.ToString();
+    }
+
+    // Right-click -> Save debug log: flush the ring buffer to a timestamped file and reveal it.
+    void SaveDebugLog()
+    {
+        try
+        {
+            Directory.CreateDirectory(HookerDir);
+            var path = Path.Combine(HookerDir, $"widget-debug-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            var header = $"Hooker {_version} debug log  ({DateTime.Now:yyyy-MM-dd HH:mm:ss})\r\nNOW :: {StateSnapshot()}\r\n----\r\n";
+            File.WriteAllText(path, header + string.Join("\r\n", _log.ToArray()) + "\r\n");
+            try { System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{path}\""); } catch { }
+        }
+        catch { }
     }
 
     // ---- persistence -----------------------------------------------------
