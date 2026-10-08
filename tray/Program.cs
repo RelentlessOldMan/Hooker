@@ -715,13 +715,26 @@ sealed class WidgetForm : Form
 
         // /clear (and an in-place /resume) gives the SAME Claude process a new session id, and the
         // old id's SessionEnd deletes its switch. Spot it by process, so the tile keeps its slot.
+        // Only a process hosting exactly ONE session can be tracked this way: an IDE extension or
+        // the desktop app runs several sessions in one process, and pairing those up would see
+        // a "swap" between sibling sessions on every tick and evict them. And the old id must
+        // really have left the registry - a session still listed was not replaced.
+        var procCount = new Dictionary<(long, long), int>();
+        foreach (var kv in reg)
+            if (kv.Value.Pid > 0)
+            {
+                var proc = (kv.Value.Pid, kv.Value.ProcStart);
+                procCount[proc] = procCount.TryGetValue(proc, out var n) ? n + 1 : 1;
+            }
         var procs = new HashSet<(long, long)>();
         foreach (var kv in reg)
         {
             if (kv.Value.Pid <= 0) continue;
             var proc = (kv.Value.Pid, kv.Value.ProcStart);
+            if (procCount[proc] > 1) continue;   // shared process: not tracked (dropped below)
             procs.Add(proc);
-            if (_procSid.TryGetValue(proc, out var old) && !old.Equals(kv.Key, StringComparison.OrdinalIgnoreCase))
+            if (_procSid.TryGetValue(proc, out var old) && !old.Equals(kv.Key, StringComparison.OrdinalIgnoreCase)
+                && !reg.ContainsKey(old))
                 SessionSwapped(old, kv.Key);
             _procSid[proc] = kv.Key;
         }
