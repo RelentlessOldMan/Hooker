@@ -31,7 +31,7 @@ A borderless, always-on-top strip. One tile per live session — here it is dock
 - **Drag a tile** — reorder it (works locked or not), to match your terminal layout.
 - **Drag the grip** (dots on the left) — move the whole widget (only when **unlocked**).
 - **Hover a tile** — a tip (placed above/below, never over the tiles) shows `name · hooking/manual · working/waiting · N auto-approvals`.
-- **Right-click** — menu: version, **Dismiss** (per tile), **Lock/Unlock position**, **System meter** (on/off), **New sessions appear** (right/left), **Grow direction** (auto / anchor-right / anchor-left), **Reset position**, **Save debug log**, **Exit**.
+- **Right-click** — menu: version, **Dismiss** (per tile), **Lock/Unlock position**, **System meter** (on/off), **Remember autopilot** (on/off, see Security), **New sessions appear** (right/left), **Grow direction** (auto / anchor-right / anchor-left), **Reset position**, **Save debug log**, **Exit**.
 
 ### System meter
 
@@ -67,6 +67,7 @@ Mitigations baked in:
 - **Every widget start begins with all sessions manual.** That includes a restart after a crash or an update, so autopilot never outlives the widget run that granted it; turn tiles back on deliberately.
 - **A resumed session starts manual.** `claude --resume` keeps the old session id, so its previous run's switch is cleared at startup. `/clear` and auto-compact keep the session's setting.
 - Switches belonging to sessions that have ended are deleted, and **uninstall** clears them all.
+- **Opt-in: Remember autopilot** (right-click menu, off by default) relaxes the two rules above for sessions *you* chose: a session you put on autopilot is switched back on when the widget restarts or you resume it with `claude -r`. Brand-new sessions still start manual, autopilot still needs the widget running, turning a tile grey makes it forgotten, sessions not seen on autopilot for 90 days are forgotten, and turning the option off forgets everything.
 
 Only turn a tile salmon when you trust what that session is doing. If in doubt, leave it grey and approve normally.
 

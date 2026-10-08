@@ -92,6 +92,12 @@ sealed class WidgetConfig
 
     public bool Meter { get; set; } = true;   // show the system meter (on unless you turn it off)
 
+    // Opt-in "Remember autopilot": sessions you put on autopilot, switched back on whenever they
+    // reappear (widget restart/update, `claude -r`). sid -> when last confirmed on (unix ms), so
+    // long-gone sessions age out. Off by default: without it every start/resume is manual.
+    public bool RememberAutopilot { get; set; }
+    public Dictionary<string, long> Autopilot { get; set; } = new();
+
     // Strip width when X/Y was captured, in logical (DPI-independent) px; 0 = legacy/unknown.
     // X/Y is a top-left corner, so if the strip comes back a different width (sessions came/went,
     // meter toggled) a right-anchored strip must shift by the difference to keep its RIGHT edge.
@@ -137,15 +143,19 @@ sealed class WidgetForm : Form
     readonly ContextMenuStrip _menu = new();
     ToolStripMenuItem _lockItem = null!, _newRight = null!, _newLeft = null!,
                       _anchorAuto = null!, _anchorRight = null!, _anchorLeft = null!,
-                      _newSideMenu = null!, _anchorMenu = null!, _exitItem = null!, _meterItem = null!;
+                      _newSideMenu = null!, _anchorMenu = null!, _exitItem = null!, _meterItem = null!, _rememberItem = null!;
 
     readonly List<string> _order = new();
     readonly Dictionary<string, Session> _sessions = new();
     readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
     readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // sids you dismissed; suppressed until they act again or die
+    bool _rememberDirty;                                                          // a restore refreshed _remembered: save once
     int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
+    bool _remember;                             // "Remember autopilot" (opt-in)
+    readonly Dictionary<string, long> _remembered = new(StringComparer.OrdinalIgnoreCase);   // sids to switch back on
+    const long RememberDays = 90;               // forget a session not seen on autopilot for this long
     readonly SystemMeter _meter = new();
     bool _locked;
     string _anchor = "auto";
@@ -287,6 +297,10 @@ sealed class WidgetForm : Form
         _anchorMenu.DropDownItems.AddRange(new ToolStripItem[] { _anchorAuto, _anchorRight, _anchorLeft });
 
         _meterItem = new ToolStripMenuItem("System meter", null, (_, _) => ToggleMeter());
+        _rememberItem = new ToolStripMenuItem("Remember autopilot", null, (_, _) => ToggleRemember())
+        {
+            ToolTipText = "Sessions you put on autopilot switch back on when they return\n(widget restart, claude -r). New sessions still start manual.",
+        };
         _exitItem = new ToolStripMenuItem("Exit", null, (_, _) => Close());
     }
 
@@ -305,6 +319,7 @@ sealed class WidgetForm : Form
         }
         _menu.Items.Add(_lockItem);
         _menu.Items.Add(_meterItem);
+        _menu.Items.Add(_rememberItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_newSideMenu);
         _menu.Items.Add(_anchorMenu);
@@ -356,6 +371,7 @@ sealed class WidgetForm : Form
     {
         _lockItem.Text = _locked ? "Unlock position" : "Lock position";
         _meterItem.Checked = _meterOn;
+        _rememberItem.Checked = _remember;
         _newRight.Checked = _newSide == "right";
         _newLeft.Checked = _newSide == "left";
         _anchorAuto.Checked = _anchor == "auto";
@@ -759,7 +775,14 @@ sealed class WidgetForm : Form
                 catch { }
             }
             else if (reg.TryGetValue(sid, out var ri) && ri.Cwd.Length > 0) s.Cwd = ri.Cwd;
-            var st = ReadShared(Path.Combine(SessionsDir, sid + ".state"));
+            var statePath = Path.Combine(SessionsDir, sid + ".state");
+            var st = ReadShared(statePath);
+            // No switch at all = this run hasn't decided: a widget start wiped it, or a resume did.
+            // A remembered session gets its autopilot back. (An explicit "off" is never overridden.)
+            if (st == null && _remember && _remembered.ContainsKey(sid))
+            {
+                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[sid] = NowMs(); _rememberDirty = true; } catch { }
+            }
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
             _sessions[sid] = s;
             live.Add(sid);
@@ -789,7 +812,7 @@ sealed class WidgetForm : Form
                 if (_newSide == "left") _order.Insert(0, sid); else _order.Add(sid);
                 changed = true;
             }
-        if (changed) SaveConfig();
+        if (changed || _rememberDirty) { _rememberDirty = false; SaveConfig(); }
 
         // Apply /name and live busy/idle status from the registry we already loaded.
         foreach (var kv in _sessions)
@@ -1174,9 +1197,31 @@ sealed class WidgetForm : Form
         {
             s.Hooking = !s.Hooking;   // didn't take: show what's really in effect, and say so
             System.Media.SystemSounds.Hand.Play();
+            Invalidate();
+            return;
+        }
+        if (_remember)
+        {
+            if (s.Hooking) _remembered[sid] = NowMs(); else _remembered.Remove(sid);
+            SaveConfig();
         }
         Invalidate();
     }
+
+    // Turning it on remembers whatever is on autopilot right now; turning it off forgets everything,
+    // so switching it back on later can't resurrect old choices.
+    void ToggleRemember()
+    {
+        _remember = !_remember;
+        _remembered.Clear();
+        if (_remember)
+            foreach (var kv in _sessions)
+                if (kv.Value.Hooking) _remembered[kv.Key] = NowMs();
+        RefreshMenuChecks();
+        SaveConfig();
+    }
+
+    static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
     void ToggleLock() { _locked = !_locked; RefreshMenuChecks(); SaveConfig(); Invalidate(); }
     void SetNewSide(string v) { _newSide = v; RefreshMenuChecks(); SaveConfig(); }
@@ -1287,6 +1332,13 @@ sealed class WidgetForm : Form
                         if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
                     foreach (var sid in c.Dismissed ?? new List<string>())
                         if (!string.IsNullOrWhiteSpace(sid)) _dismissed.Add(sid);
+                    _remember = c.RememberAutopilot;
+                    if (_remember)
+                    {
+                        long cutoff = NowMs() - RememberDays * 86_400_000;
+                        foreach (var kv in c.Autopilot ?? new Dictionary<string, long>())
+                            if (SafeId(kv.Key) && kv.Value >= cutoff) _remembered[kv.Key] = kv.Value;
+                    }
                     // HomeSet, or (legacy configs, which used -1 for "unset") non-negative coords.
                     if (c.HomeSet || (c.X >= 0 && c.Y >= 0))
                     {
@@ -1316,6 +1368,7 @@ sealed class WidgetForm : Form
                 // remembered spot.
                 X = _home.X, Y = _home.Y, HomeSet = _homeSet, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
                 Anchor = _anchor, NewSide = _newSide, Order = new(_order), Dismissed = new(_dismissed),
+                RememberAutopilot = _remember, Autopilot = new(_remembered),
                 HomeRight = _relRight, HomeBottom = _relBottom,
                 HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,
             }));
