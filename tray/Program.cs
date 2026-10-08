@@ -153,6 +153,7 @@ sealed class WidgetForm : Form
     bool _configDirty;                                                            // sync changed something persisted: save once
     readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // sids whose switch was last seen "on"
     readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current sid
+    readonly Dictionary<long, (string Name, long Created)> _pidSeen = new();       // what each registered pid was when first seen
     readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new sid <- same process swapped ids
     int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
@@ -710,7 +711,7 @@ sealed class WidgetForm : Form
         // Unusable = no registry folder, or entries present but none readable (format change, or every
         // file mid-write): don't prune blind. An empty-but-present folder is usable: no live sessions,
         // so the last tile goes away too.
-        var reg = LoadRegistry(out bool regUsable);
+        var reg = LoadRegistry(_pidSeen, out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
         // /clear (and an in-place /resume) gives the SAME Claude process a new session id, and the
@@ -914,7 +915,7 @@ sealed class WidgetForm : Form
     // session id -> what Claude knows about it. This is both our liveness signal and (since a
     // live session may have no .meta yet) the list of tiles to show. Undocumented/internal, so
     // best-effort - any failure just drops that entry and we fall back to folder + hook signal.
-    static Dictionary<string, RegInfo> LoadRegistry(out bool usable)
+    static Dictionary<string, RegInfo> LoadRegistry(Dictionary<long, (string Name, long Created)> pidSeen, out bool usable)
     {
         var map = new Dictionary<string, RegInfo>(StringComparer.OrdinalIgnoreCase);
         usable = false;
@@ -925,6 +926,7 @@ sealed class WidgetForm : Form
             if (!Directory.Exists(dir)) return map;
             var files = Directory.GetFiles(dir, "*.json");
             int parsed = 0;
+            var pids = new HashSet<long>();
             foreach (var f in files)
             {
                 try
@@ -944,7 +946,8 @@ sealed class WidgetForm : Form
                     long pid = r.TryGetProperty("pid", out var pe) && pe.TryGetInt64(out var pv) ? pv : 0;
                     long procStart = r.TryGetProperty("procStart", out var ps) && ps.ValueKind == JsonValueKind.String
                                      && long.TryParse(ps.GetString(), out var pst) ? pst : 0;
-                    if (pid > 0 && !ProcessAlive(pid)) continue;
+                    if (pid > 0) pids.Add(pid);
+                    if (pid > 0 && !ProcessAlive(pid, pidSeen)) continue;
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
@@ -955,21 +958,36 @@ sealed class WidgetForm : Form
                 catch { }
             }
             usable = files.Length == 0 || parsed > 0;   // all-dead is still a readable registry
+            if (usable)
+                foreach (var pid in new List<long>(pidSeen.Keys))
+                    if (!pids.Contains(pid)) pidSeen.Remove(pid);
         }
         catch { }
         return map;
     }
 
-    // Is this pid still running? Only "no such process" or "has exited" counts as dead; anything we
-    // can't determine counts as alive - this only ever drops entries we're sure about.
-    // Deliberately NOT compared against the entry's procStart: it doesn't match the process's creation
-    // time exactly on every machine, and a mismatch evicted every live, idle session (v1.0.26-29).
-    static bool ProcessAlive(long pid)
+    // Is this pid still the process Claude registered? Dead = no such process, it has exited, or the
+    // pid now belongs to a different process (a crashed Claude's pid reused): its exe name or creation
+    // time differs from what WE saw the first time this pid was listed. Both come from Windows, so
+    // this holds however Claude is installed. Deliberately NOT compared against the entry's procStart:
+    // that doesn't match the creation time exactly on every machine, and a mismatch evicted every
+    // live, idle session (v1.0.26-29). Anything we can't determine counts as alive.
+    static bool ProcessAlive(long pid, Dictionary<long, (string Name, long Created)> pidSeen)
     {
         if (pid > uint.MaxValue) return true;
         var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         if (h == IntPtr.Zero) return Marshal.GetLastWin32Error() != ERROR_INVALID_PARAMETER;   // 87 = no such process
-        try { return !(GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE); }
+        try
+        {
+            if (GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE) return false;
+            var sb = new System.Text.StringBuilder(1024);
+            int len = sb.Capacity;
+            if (!QueryFullProcessImageName(h, 0, sb, ref len)
+                || !GetProcessTimes(h, out long created, out _, out _, out _)) return true;
+            var now = (Name: Path.GetFileName(sb.ToString()), Created: created);
+            if (!pidSeen.TryGetValue(pid, out var first)) { pidSeen[pid] = now; return true; }
+            return first.Created == now.Created && string.Equals(first.Name, now.Name, StringComparison.OrdinalIgnoreCase);
+        }
         finally { CloseHandle(h); }
     }
     const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, STILL_ACTIVE = 259;
@@ -977,6 +995,8 @@ sealed class WidgetForm : Form
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, uint flags, System.Text.StringBuilder name, ref int size);
 
     static bool SafeId(string sid)
     {
