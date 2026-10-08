@@ -944,7 +944,7 @@ sealed class WidgetForm : Form
                     long pid = r.TryGetProperty("pid", out var pe) && pe.TryGetInt64(out var pv) ? pv : 0;
                     long procStart = r.TryGetProperty("procStart", out var ps) && ps.ValueKind == JsonValueKind.String
                                      && long.TryParse(ps.GetString(), out var pst) ? pst : 0;
-                    if (pid > 0 && !ProcessAlive(pid, procStart)) continue;
+                    if (pid > 0 && !ProcessAlive(pid)) continue;
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
@@ -960,27 +960,22 @@ sealed class WidgetForm : Form
         return map;
     }
 
-    // Is this pid still the process that wrote the entry? procStart is its creation time (FILETIME,
-    // matches GetProcessTimes exactly), which catches a recycled pid. Anything we can't determine
-    // counts as alive - this only ever drops entries we're sure about.
-    static bool ProcessAlive(long pid, long procStart)
+    // Is this pid still running? Only "no such process" or "has exited" counts as dead; anything we
+    // can't determine counts as alive - this only ever drops entries we're sure about.
+    // Deliberately NOT compared against the entry's procStart: it doesn't match the process's creation
+    // time exactly on every machine, and a mismatch evicted every live, idle session (v1.0.26-29).
+    static bool ProcessAlive(long pid)
     {
         if (pid > uint.MaxValue) return true;
         var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         if (h == IntPtr.Zero) return Marshal.GetLastWin32Error() != ERROR_INVALID_PARAMETER;   // 87 = no such process
-        try
-        {
-            if (GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE) return false;
-            if (procStart != 0 && GetProcessTimes(h, out long created, out _, out _, out _) && created != procStart) return false;
-            return true;
-        }
+        try { return !(GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE); }
         finally { CloseHandle(h); }
     }
     const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, STILL_ACTIVE = 259;
     const int ERROR_INVALID_PARAMETER = 87;
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
-    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 
     static bool SafeId(string sid)
