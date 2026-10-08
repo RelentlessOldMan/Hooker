@@ -9,11 +9,26 @@
 
 $ErrorActionPreference = 'Stop'
 
-# Hooker's own entries: any command ending in dist/hook.exe, wherever the folder lives - so a
-# re-install from a moved or newer release folder replaces the old entry instead of leaving
-# both registered (both would run on every event).
+# Hooker's own entries: a dist/hook.exe that sits next to HookerWidget.exe, wherever the folder
+# lives - so a re-install from a moved or newer release folder replaces the old entry instead of
+# leaving both registered (both would run on every event) - or one whose exe is gone (a deleted
+# old folder, which would only error on every event). Another tool's dist/hook.exe is left alone.
 # The command is written quoted (see install-hook.ps1); older installs wrote it bare - match both.
-function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe"?$' }
+function Test-HookerCommand([string]$c) {
+    if ($c -notmatch '^"?(.*[\\/]dist[\\/]hook\.exe)"?$') { return $false }
+    $exe = $Matches[1]
+    if (-not (Test-Path -LiteralPath $exe)) { return $true }
+    return (Test-Path -LiteralPath (Join-Path (Split-Path $exe) 'HookerWidget.exe'))
+}
+
+# Put $src's content in place as settings.json. A symlinked settings.json (kept in a dotfiles repo)
+# is written through to its target - swapping the file in would replace the link with a copy.
+function Set-Settings([string]$src, [string]$dst, [switch]$Move) {
+    $item = Get-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+    if ($Move -and -not ($item -and $item.LinkType)) { Move-Item $src $dst -Force; return }
+    [System.IO.File]::WriteAllBytes($dst, [System.IO.File]::ReadAllBytes($src))
+    if ($Move) { Remove-Item $src -Force -ErrorAction SilentlyContinue }
+}
 
 # An event's hook groups minus Hooker's own commands: a group holding only Hooker goes, but a
 # group where you'd also put hooks of your own keeps them.
@@ -87,11 +102,11 @@ try {
     $out = $json | ConvertTo-Json -Depth 100   # deep enough that nothing of yours gets flattened
     [System.IO.File]::WriteAllText($tmp, $out, (New-Object System.Text.UTF8Encoding $false))
     $null = Get-Content $tmp -Raw -Encoding UTF8 | ConvertFrom-Json   # validate before replacing
-    Move-Item $tmp $settings -Force
+    Set-Settings $tmp $settings -Move
 }
 catch {
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-    if ($backup) { Copy-Item $backup $settings -Force; Write-Warning "Install failed; restored settings from $backup" }
+    if ($backup) { Set-Settings $backup $settings; Write-Warning "Install failed; restored settings from $backup" }
     throw
 }
 

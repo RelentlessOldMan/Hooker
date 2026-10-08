@@ -155,15 +155,17 @@ try
     switch (evt)
     {
         case "SessionStart":
-            // Awaiting your first prompt. A NEW or RESUMED session (a fresh Claude process) starts
-            // manual with a fresh tally: a resumed session keeps its old id, and must not come back
-            // already on autopilot from a .state its previous run left behind. /clear and
-            // auto-compact are the same running session, so they keep hooking and the count.
+            // Awaiting your first prompt. A NEW or RESUMED session starts manual with a fresh tally:
+            // a resumed session keeps its old id, and must not come back already on autopilot from a
+            // .state its previous run left behind. Auto-compact keeps the id, so it keeps both.
+            // /clear gets a NEW id (its old one ends) - the widget sees the same process swap ids and
+            // carries autopilot over once it reads start == "clear" here.
             bool fresh = source is not ("clear" or "compact");
             if (fresh) { try { File.Delete(statePath); } catch { } }
             UpdateMeta(m =>
             {
                 m.status = "waiting";
+                m.start = source;
                 if (cwd.Length > 0) m.cwd = cwd;
                 if (fresh) m.count = 0;
             });
@@ -196,7 +198,7 @@ try
 }
 catch
 {
-    // Fail open to normal behaviour — never disrupt Claude.
+    // Fail safe to normal behaviour (no decision = Claude prompts as usual) — never disrupt Claude.
 }
 
 return 0;
@@ -207,4 +209,5 @@ sealed class Meta
     public string status { get; set; } = "working";
     public string cwd { get; set; } = "";
     public long count { get; set; } = 0;
+    public string start { get; set; } = "";   // SessionStart source: startup|resume|clear|compact
 }

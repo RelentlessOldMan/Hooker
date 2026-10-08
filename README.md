@@ -65,9 +65,9 @@ Mitigations baked in:
 - Hooking is **off by default**, per session.
 - **Autopilot only exists while the widget is running.** `hook.exe` auto-approves only if the session is switched on *and* the widget is alive, so a crashed or killed widget grants nothing, whatever is left on disk. A clean exit also switches every session off.
 - **Every widget start begins with all sessions manual.** That includes a restart after a crash or an update, so autopilot never outlives the widget run that granted it; turn tiles back on deliberately.
-- **A resumed session starts manual.** `claude --resume` keeps the old session id, so its previous run's switch is cleared at startup. `/clear` and auto-compact keep the session's setting.
-- Switches belonging to sessions that have ended are deleted, and **uninstall** clears them all.
-- **Opt-in: Remember autopilot** (right-click menu, off by default) relaxes the two rules above for sessions *you* chose: a session you put on autopilot is switched back on when the widget restarts or you resume it with `claude -r`. Brand-new sessions still start manual, autopilot still needs the widget running, turning a tile grey makes it forgotten, sessions not seen on autopilot for 90 days are forgotten, and turning the option off forgets everything.
+- **A resumed session starts manual.** `claude --resume` keeps the old session id, so its previous run's switch is cleared at startup. Auto-compact keeps the session's setting, and so does `/clear` — it starts a new session id in the same Claude process, and the widget carries the switch across (the tile keeps its place; its count starts again). A `/resume` *inside* a session counts as a resume: manual.
+- Switches belonging to sessions that have ended are deleted. **Uninstall** stops the widget and clears every switch and the Remember autopilot list.
+- **Opt-in: Remember autopilot** (right-click menu, off by default) relaxes the two rules above for sessions *you* chose: a session you put on autopilot is switched back on when the widget restarts or you resume it with `claude -r`. Brand-new sessions still start manual, autopilot still needs the widget running, turning a tile grey or dismissing it makes it forgotten, sessions not seen on autopilot for 90 days are forgotten, and turning the option off forgets everything.
 
 Only turn a tile salmon when you trust what that session is doing. If in doubt, leave it grey and approve normally.
 
@@ -80,7 +80,7 @@ hooks  (hook.exe)         --writes--> ...\.claude\hooker\sessions\<sid>.meta    
 ```
 
 `hook.exe` is registered on six Claude events, all per session:
-- `SessionStart` → new tile (waiting); on a new or resumed session also count reset + hooking off (`/clear` and compact keep both)
+- `SessionStart` → new tile (waiting); on a new or resumed session also count reset + hooking off (compact keeps both; `/clear` is a new id the widget carries hooking over to)
 - `UserPromptSubmit` / `PreToolUse` → working (`PreToolUse` auto-approves + bumps the count when that session is hooking)
 - `AskUserQuestion` (a `PreToolUse`) → waiting (Claude needs you to pick)
 - `Stop`, `Notification` → waiting
@@ -88,7 +88,7 @@ hooks  (hook.exe)         --writes--> ...\.claude\hooker\sessions\<sid>.meta    
 
 The widget also reads Claude's internal per-session registry (`~/.claude/sessions/*.json`) for which sessions are live, their `/name` title and live busy status — **best-effort**: it's undocumented and may change between Claude versions, in which case tiles fall back to folder names + hook-based status (nothing breaks).
 
-The shim **fails open**: any error → prints nothing, exits 0 → Claude behaves normally. It never blocks Claude.
+The shim **fails safe**: any error → prints nothing, exits 0 → Claude prompts as normal (nothing is auto-approved). It never blocks Claude.
 
 ## Install (just want to use it)
 
@@ -124,7 +124,7 @@ This is a personal tool, published as-is — **issues and pull requests aren't a
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall-hook.ps1
 ```
-Removes only Hooker's hooks (yours are preserved) and turns autopilot off for every session. Without them, Claude behaves exactly as stock.
+Removes only Hooker's hooks (yours are preserved — another tool's `dist\hook.exe` included; Hooker's is recognised by `HookerWidget.exe` sitting next to it, or by its folder being gone), stops the widget and turns autopilot off for every session, Remember autopilot list included. Without them, Claude behaves exactly as stock.
 
 ## Troubleshooting
 

@@ -31,6 +31,18 @@ if ($Version) {
 } else {
     $p = $cur.Split('.'); $p[2] = [int]$p[2] + 1; $ver = ($p -join '.')
 }
+if ([version]$ver -le [version]$cur) { throw "v$ver is not newer than the current v$cur." }
+# The tag must be free, and main must not be behind GitHub: either would only fail AFTER the
+# release commit was made (push rejected, or 'gh release create' on a taken tag).
+git rev-parse --quiet --verify "refs/tags/v$ver" > $null
+if ($LASTEXITCODE -eq 0) { throw "Tag v$ver already exists." }
+$remoteTag = git ls-remote --tags origin "refs/tags/v$ver"
+if ($LASTEXITCODE -ne 0) { throw "Can't reach origin (git ls-remote failed)." }
+if ($remoteTag) { throw "Tag v$ver already exists on GitHub." }
+git fetch --quiet origin main
+if ($LASTEXITCODE -ne 0) { throw "git fetch origin main failed." }
+$behind = [int]((git rev-list --count HEAD..origin/main | Out-String).Trim())
+if ($behind -gt 0) { throw "main is $behind commit(s) behind origin/main - pull first." }
 Write-Host "Releasing v$cur -> v$ver"
 
 # 3. Stop the widget (it locks its own exe); remember to relaunch at the end.

@@ -150,7 +150,10 @@ sealed class WidgetForm : Form
     readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
     readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // sids you dismissed; suppressed until they act again or die
-    bool _rememberDirty;                                                          // a restore refreshed _remembered: save once
+    bool _configDirty;                                                            // sync changed something persisted: save once
+    readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // sids whose switch was last seen "on"
+    readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current sid
+    readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new sid <- same process swapped ids
     int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
     bool _remember;                             // "Remember autopilot" (opt-in)
@@ -360,6 +363,8 @@ sealed class WidgetForm : Form
     {
         _dismissed.Add(sid);   // the session is still live, so without this the tile returns next tick
         DeleteSessionFiles(sid);
+        _lastOn.Remove(sid);
+        _remembered.Remove(sid);   // hiding a tile ends its autopilot for good - it comes back manual
         _regMiss.Remove(sid);
         _order.Remove(sid);
         _sessions.Remove(sid);
@@ -708,6 +713,22 @@ sealed class WidgetForm : Form
         var reg = LoadRegistry(out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
+        // /clear (and an in-place /resume) gives the SAME Claude process a new session id, and the
+        // old id's SessionEnd deletes its switch. Spot it by process, so the tile keeps its slot.
+        var procs = new HashSet<(long, long)>();
+        foreach (var kv in reg)
+        {
+            if (kv.Value.Pid <= 0) continue;
+            var proc = (kv.Value.Pid, kv.Value.ProcStart);
+            procs.Add(proc);
+            if (_procSid.TryGetValue(proc, out var old) && !old.Equals(kv.Key, StringComparison.OrdinalIgnoreCase))
+                SessionSwapped(old, kv.Key);
+            _procSid[proc] = kv.Key;
+        }
+        if (regUsable)
+            foreach (var proc in new List<(long Pid, long ProcStart)>(_procSid.Keys))
+                if (!procs.Contains(proc)) _procSid.Remove(proc);
+
         var metas = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         try { foreach (var f in Directory.GetFiles(SessionsDir, "*.meta")) metas[Path.GetFileNameWithoutExtension(f)] = f; }
         catch { }
@@ -743,6 +764,7 @@ sealed class WidgetForm : Form
                 {
                     _regMiss.Remove(sid);
                     _dismissed.Remove(sid);
+                    _lastOn.Remove(sid);
                     DeleteSessionFiles(sid);
                     continue;
                 }
@@ -764,26 +786,46 @@ sealed class WidgetForm : Form
                 && reg.TryGetValue(sid, out var pre) && pre.Status.Length == 0) continue;
 
             var s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
+            string start = "";   // how this id's SessionStart came about (startup|resume|clear|compact)
             if (metaPath != null)
             {
                 try
                 {
                     var text = ReadShared(metaPath);
                     var m = text != null ? JsonSerializer.Deserialize<MetaDto>(text) : null;
-                    if (m != null) { s.Status = m.status ?? "working"; s.Cwd = m.cwd ?? ""; s.Count = Math.Max(0, m.count); }
+                    if (m != null) { s.Status = m.status ?? "working"; s.Cwd = m.cwd ?? ""; s.Count = Math.Max(0, m.count); start = m.start ?? ""; }
                 }
                 catch { }
             }
             else if (reg.TryGetValue(sid, out var ri) && ri.Cwd.Length > 0) s.Cwd = ri.Cwd;
             var statePath = Path.Combine(SessionsDir, sid + ".state");
             var st = ReadShared(statePath);
+            // A process that swapped ids carries its autopilot over - but only once this id's own
+            // SessionStart says it was /clear (written since the swap, so no leftover .meta counts).
+            // An in-place /resume of another conversation starts manual, like any resume.
+            if (_swapped.TryGetValue(sid, out var sw))
+            {
+                bool fresh = start.Length > 0 && metaPath != null && MetaWrittenSince(metaPath, sw.At - 5000);
+                if (fresh && start == "clear" && sw.WasOn && st == null)
+                {
+                    try
+                    {
+                        WriteAtomic(statePath, "on"); st = "on";
+                        if (_remember) { _remembered[sid] = NowMs(); _configDirty = true; }
+                    }
+                    catch { }
+                }
+                if (fresh || NowMs() - sw.At > 10_000) _swapped.Remove(sid);
+            }
             // No switch at all = this run hasn't decided: a widget start wiped it, or a resume did.
             // A remembered session gets its autopilot back. (An explicit "off" is never overridden.)
             if (st == null && _remember && _remembered.ContainsKey(sid))
             {
-                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[sid] = NowMs(); _rememberDirty = true; } catch { }
+                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[sid] = NowMs(); _configDirty = true; } catch { }
             }
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
+            // Track the switch only while it exists: SessionEnd deletes it just before a swap shows.
+            if (st != null) { if (s.Hooking) _lastOn.Add(sid); else _lastOn.Remove(sid); }
             _sessions[sid] = s;
             live.Add(sid);
         }
@@ -812,7 +854,7 @@ sealed class WidgetForm : Form
                 if (_newSide == "left") _order.Insert(0, sid); else _order.Add(sid);
                 changed = true;
             }
-        if (changed || _rememberDirty) { _rememberDirty = false; SaveConfig(); }
+        if (changed || _configDirty) { _configDirty = false; SaveConfig(); }
 
         // Apply /name and live busy/idle status from the registry we already loaded.
         foreach (var kv in _sessions)
@@ -829,6 +871,30 @@ sealed class WidgetForm : Form
     {
         try { return File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddSeconds(-30); }
         catch { return false; }
+    }
+
+    static bool MetaWrittenSince(string path, long unixMs)
+    {
+        try { return new DateTimeOffset(File.GetLastWriteTimeUtc(path)).ToUnixTimeMilliseconds() >= unixMs; }
+        catch { return false; }
+    }
+
+    // The same Claude process moved from `old` to `now` (/clear, or /resume inside the session).
+    // The new id takes the old tile's slot; whether autopilot follows is decided once its
+    // SessionStart has said which it was (see SyncSessions).
+    void SessionSwapped(string old, string now)
+    {
+        _swapped[now] = (NowMs(), _lastOn.Remove(old));
+        int i = _order.IndexOf(old);
+        if (i >= 0)
+        {
+            if (_order.Contains(now)) _order.RemoveAt(i); else _order[i] = now;
+            _configDirty = true;
+        }
+        _sessions.Remove(old);
+        _regMiss.Remove(old);
+        if (_dismissed.Remove(old)) _configDirty = true;
+        DeleteSessionFiles(old);   // it has ended (its SessionEnd does the same); no lingering tile
     }
 
     // Read Claude Code's per-session registry (~/.claude/sessions/<pid>.json): maps our
@@ -871,7 +937,7 @@ sealed class WidgetForm : Form
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
                     long started = r.TryGetProperty("startedAt", out var t)
                                    && t.ValueKind == JsonValueKind.Number && t.TryGetInt64(out var ms) ? ms : 0;
-                    map[sid] = new RegInfo(name, status, cwd, started);
+                    map[sid] = new RegInfo(name, status, cwd, started, pid, procStart);
                 }
                 catch { }
             }
@@ -920,12 +986,13 @@ sealed class WidgetForm : Form
     }
 
     // What we keep from one registry entry.
-    readonly record struct RegInfo(string Name, string Status, string Cwd, long StartedAt);
+    readonly record struct RegInfo(string Name, string Status, string Cwd, long StartedAt, long Pid, long ProcStart);
 
     // Lowercase keys mirror the .meta JSON the shim writes.
     sealed class MetaDto
     {
         public string status { get; set; } = "working";
+        public string start { get; set; } = "";
         public string cwd { get; set; } = "";
         public long count { get; set; }
     }
@@ -1148,6 +1215,23 @@ sealed class WidgetForm : Form
         base.OnMouseUp(e);
     }
 
+    // Focus yanked away mid-drag (Alt-Tab, the Win key, a UAC prompt) and the button-up never
+    // arrives. Finish the drag right here, or tile sync and display handling stay paused until
+    // your next click. (A plain click, never moved, is left for OnMouseUp to toggle.)
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        if (!Capture && _moved)
+        {
+            if (_hitKind == Hit.Grip && !_locked) { EnsureOnScreen(); SetHome(Location); ComputeRel(); }
+            SaveConfig();
+            _hitKind = Hit.None;
+            _dragSid = null;
+            _moved = false;
+            Invalidate();
+        }
+        base.OnMouseCaptureChanged(e);
+    }
+
     const string MeterHoverKey = "meter:";   // hover key for the meter; can't collide with a session id
 
     void UpdateHover(Point p)
@@ -1245,6 +1329,7 @@ sealed class WidgetForm : Form
         {
             var fg = GetForegroundWindow();
             if (fg == IntPtr.Zero || fg == Handle) return false;
+            if (fg == GetShellWindow() || IsDesktopClass(fg)) return false;   // clicked the desktop / Win+D
 
             var myMon = MonitorFromWindow(Handle, MONITOR_DEFAULTTONEAREST);
             var fgMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
@@ -1319,7 +1404,7 @@ sealed class WidgetForm : Form
         {
             if (File.Exists(ConfigPath))
             {
-                var c = JsonSerializer.Deserialize<WidgetConfig>(File.ReadAllText(ConfigPath));
+                var c = ParseConfig(File.ReadAllText(ConfigPath));
                 if (c != null)
                 {
                     // Coerce hand-edited / corrupt values to valid ones, and drop null/blank or
@@ -1328,16 +1413,19 @@ sealed class WidgetForm : Form
                     _anchor = c.Anchor is "left" or "right" or "auto" ? c.Anchor : "auto";
                     _newSide = c.NewSide is "left" or "right" ? c.NewSide : "right";
                     _meterOn = c.Meter;
+                    // Ids name files in the sessions folder: only ones that can't point anywhere else.
                     foreach (var sid in c.Order ?? new List<string>())
-                        if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
+                        if (!string.IsNullOrEmpty(sid) && SafeId(sid) && !_order.Contains(sid)) _order.Add(sid);
                     foreach (var sid in c.Dismissed ?? new List<string>())
-                        if (!string.IsNullOrWhiteSpace(sid)) _dismissed.Add(sid);
+                        if (!string.IsNullOrEmpty(sid) && SafeId(sid)) _dismissed.Add(sid);
                     _remember = c.RememberAutopilot;
                     if (_remember)
                     {
-                        long cutoff = NowMs() - RememberDays * 86_400_000;
+                        long now = NowMs(), cutoff = now - RememberDays * 86_400_000;
+                        // A stamp from the future (clock was wrong) would never age out: drop it.
                         foreach (var kv in c.Autopilot ?? new Dictionary<string, long>())
-                            if (SafeId(kv.Key) && kv.Value >= cutoff) _remembered[kv.Key] = kv.Value;
+                            if (kv.Key.Length > 0 && SafeId(kv.Key) && kv.Value >= cutoff && kv.Value <= now + 86_400_000)
+                                _remembered[kv.Key] = kv.Value;
                     }
                     // HomeSet, or (legacy configs, which used -1 for "unset") non-negative coords.
                     if (c.HomeSet || (c.X >= 0 && c.Y >= 0))
@@ -1354,6 +1442,21 @@ sealed class WidgetForm : Form
         }
         catch { }
         RefreshMenuChecks();
+    }
+
+    // One bad value (a hand edit, a null) mustn't cost every other setting: if the whole file
+    // won't bind, take each setting that does.
+    static WidgetConfig? ParseConfig(string text)
+    {
+        try { return JsonSerializer.Deserialize<WidgetConfig>(text); }
+        catch (JsonException) { }
+        using var doc = JsonDocument.Parse(text);   // not JSON at all: throws, and defaults stand
+        if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+        var c = new WidgetConfig();
+        foreach (var prop in typeof(WidgetConfig).GetProperties())
+            if (prop.CanWrite && doc.RootElement.TryGetProperty(prop.Name, out var v))
+                try { var val = v.Deserialize(prop.PropertyType); if (val != null) prop.SetValue(c, val); } catch { }
+        return c;
     }
 
     void SaveConfig()
@@ -1428,6 +1531,17 @@ sealed class WidgetForm : Form
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int nIndex);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
+
+    // The desktop is a borderless window covering the screen, so it would pass for a fullscreen app.
+    static bool IsDesktopClass(IntPtr h)
+    {
+        var sb = new System.Text.StringBuilder(32);
+        if (GetClassName(h, sb, sb.Capacity) == 0) return false;
+        var c = sb.ToString();
+        return c == "Progman" || c == "WorkerW";
+    }
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO mi);
@@ -1490,8 +1604,8 @@ sealed class TipWindow : Form
         // sitting near the taskbar); otherwise below. Then keep it on the monitor.
         bool below = widget.Top < scr.WorkingArea.Top + scr.WorkingArea.Height / 2;
         int y = below ? widget.Bottom + Gap : widget.Top - Height - Gap;
-        int x = Math.Clamp(anchorCenterX - Width / 2, scr.Bounds.Left, scr.Bounds.Right - Width);
-        y = Math.Clamp(y, scr.Bounds.Top, scr.Bounds.Bottom - Height);
+        int x = Math.Clamp(anchorCenterX - Width / 2, scr.Bounds.Left, Math.Max(scr.Bounds.Left, scr.Bounds.Right - Width));
+        y = Math.Clamp(y, scr.Bounds.Top, Math.Max(scr.Bounds.Top, scr.Bounds.Bottom - Height));
         Location = new Point(x, y);
 
         if (!Visible) Show();
