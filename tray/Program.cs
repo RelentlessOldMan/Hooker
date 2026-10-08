@@ -88,10 +88,14 @@ sealed class WidgetConfig
 
     public bool Meter { get; set; } = true;   // show the system meter (on unless you turn it off)
 
-    // Strip width when X/Y was captured (0 = legacy/unknown). X/Y is a top-left corner, so if the
-    // strip comes back a different width (sessions came/went, meter toggled) a right-anchored
-    // strip must shift by the difference to keep its RIGHT edge where you put it.
-    public int HomeW { get; set; }
+    // Strip width when X/Y was captured, in logical (DPI-independent) px; 0 = legacy/unknown.
+    // X/Y is a top-left corner, so if the strip comes back a different width (sessions came/went,
+    // meter toggled) a right-anchored strip must shift by the difference to keep its RIGHT edge.
+    public double HomeW { get; set; }
+
+    // Whether X/Y holds a real spot. A flag, not a sign test: a monitor left of / above the
+    // primary has negative coordinates, which are perfectly valid homes.
+    public bool HomeSet { get; set; }
 }
 
 sealed class WidgetForm : Form
@@ -136,6 +140,7 @@ sealed class WidgetForm : Form
     readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
     readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // sids you dismissed; suppressed until they act again or die
+    int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
     readonly SystemMeter _meter = new();
     bool _locked;
@@ -143,7 +148,8 @@ sealed class WidgetForm : Form
     string _newSide = "right";
     Point _home = new(-1, -1);   // the spot you chose (persisted); we always return here, and only
                                  // ever clamp *off* it temporarily to stay visible — never saving that.
-    int _homeW;                  // strip width when _home was captured; see RebaseHome
+    bool _homeSet;               // _home holds a real spot (coordinates may be negative on a left/upper monitor)
+    double _homeW;               // logical strip width when _home was captured; see RebaseHome
     bool _relValid;              // edge-relative spec of _home captured (which corner + logical gap)
     bool _relRight, _relBottom = true;
     double _relGapX, _relGapY;
@@ -191,6 +197,12 @@ sealed class WidgetForm : Form
         _ = Handle;                          // create handle so the timer pumps while hidden
         UpdateScale();                       // adopt the starting monitor's DPI before first layout
         try { Directory.CreateDirectory(SessionsDir); } catch { }   // once, not every tick
+
+        // Autopilot never outlives the widget instance that granted it. OnFormClosing turns every
+        // session off, but a crash, a Task Manager kill or a release restart skips that - so
+        // start every session manual, whatever earlier runs left behind. (The shim also refuses
+        // to auto-approve while no widget is running; this covers the restart.)
+        try { foreach (var f in Directory.GetFiles(SessionsDir, "*.state")) File.Delete(f); } catch { }
 
         SyncSessions();
         InitialLayout();
@@ -362,10 +374,11 @@ sealed class WidgetForm : Form
     void InitialLayout()
     {
         Size = ContentSize();
-        if (Location.X < 0 || Location.Y < 0) DockDefault();
-        if (_home.X < 0) SetHome(Location);  // first run / legacy config with no saved spot
+        if (!_homeSet) DockDefault();        // first run / no saved spot: centered above the taskbar
         RebaseHome();                        // came back a different width than when home was saved
-        if (_home.X >= 0) Location = _home;
+        // Started on a screen home doesn't fit (inside an RDP session): same corner + gap as home,
+        // exactly as ReconcileDisplay would place us, rather than a hard clamp to the edge.
+        Location = !HomeFitsSomeScreen() && _relValid ? HomeFromRel() : _home;
         EnsureOnScreen();                    // clamp only the live position; _home is the truth
         if (HomeFitsSomeScreen()) ComputeRel();   // capture/refresh the edge-relative spec (also migrates legacy configs)
         UpdateRegion();
@@ -492,9 +505,10 @@ sealed class WidgetForm : Form
     // on a bigger/other screen (e.g. your local 4K) and we're currently on a smaller foreign
     // one (a Remote Desktop session), so the live position is just a visibility clamp — not a
     // spot to adopt as home.
-    bool HomeFitsSomeScreen()
+    bool HomeFitsSomeScreen() => FitsSomeScreen(new Rectangle(_home, Size));
+
+    static bool FitsSomeScreen(Rectangle r)
     {
-        var r = new Rectangle(_home, Size);
         foreach (var s in Screen.AllScreens)
             if (s.Bounds.Contains(r)) return true;
         return false;
@@ -520,18 +534,24 @@ sealed class WidgetForm : Form
     // you return to your real display.
     void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) { SetHome(Location); ComputeRel(); } }
 
-    void SetHome(Point p) { _home = p; _homeW = Width; }
+    void SetHome(Point p) { _home = p; _homeSet = true; _homeW = Width / _scale; }
 
-    // _home is a top-left corner captured at width _homeW. If the strip is now a different width
-    // (it restarted with more/fewer tiles, the meter was toggled, or it resized while away on an
-    // RDP screen where home couldn't be updated), keep the ANCHORED edge where you put it - the
-    // same rule live growth follows - instead of the left edge, which used to drift a
-    // right-anchored strip sideways on every restart.
+    // _home is a top-left corner captured when the strip was _homeW logical px wide. If it is now
+    // a different width (restarted with more/fewer tiles, meter toggled), keep the ANCHORED edge
+    // where you put it - the same rule live growth follows - instead of the left edge, which used
+    // to drift a right-anchored strip sideways on every restart. Widths are logical, so a DPI
+    // change alone (an RDP session) is never mistaken for growth; and we only rebase while home's
+    // own screen is present - on a foreign screen ReconcileDisplay places us by the rel spec.
     void RebaseHome()
     {
-        if (_home.X < 0 || _homeW <= 0 || _homeW == Width) { if (_home.X >= 0 && _homeW <= 0) _homeW = Width; return; }
-        if (AnchorRightFor(new Rectangle(_home, new Size(_homeW, Height)))) _home.X += _homeW - Width;
-        _homeW = Width;
+        if (!_homeSet) return;
+        double now = Width / _scale;
+        if (_homeW <= 0) { _homeW = now; return; }            // legacy config: adopt as-is
+        if (Math.Abs(_homeW - now) < 0.5) return;
+        var was = new Rectangle(_home, new Size((int)Math.Round(_homeW * _scale), Height));
+        if (!FitsSomeScreen(was)) return;                     // away from home's screen: leave home alone
+        if (AnchorRightFor(was)) _home.X += was.Width - Width;
+        _homeW = now;
     }
 
     // Capture _home as an edge-relative spec: which corner it hugs, and the logical (DPI-normalized)
@@ -540,7 +560,7 @@ sealed class WidgetForm : Form
     // _home sits on a real monitor.
     void ComputeRel()
     {
-        if (_home.X < 0) return;
+        if (!_homeSet) return;
         var b = Screen.FromRectangle(new Rectangle(_home, Size)).Bounds;
         _relRight  = _home.X + Width / 2 >= b.Left + b.Width / 2;
         _relBottom = _home.Y + Height / 2 >= b.Top + b.Height / 2;
@@ -603,8 +623,8 @@ sealed class WidgetForm : Form
             // On home's own screen, snap to the exact spot. On a smaller/foreign screen where home
             // no longer fits, reproduce the same corner + gap (left of the tray) instead of letting
             // EnsureOnScreen hard-clamp it against the edge.
-            bool usedRel = _home.X >= 0 && !HomeFitsSomeScreen() && _relValid;
-            if (_home.X >= 0)
+            bool usedRel = _homeSet && !HomeFitsSomeScreen() && _relValid;
+            if (_homeSet)
                 Location = usedRel ? HomeFromRel() : _home;
             EnsureOnScreen();
             UpdateRegion();
@@ -635,7 +655,7 @@ sealed class WidgetForm : Form
     {
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
             return sr.ReadToEnd();
         }
@@ -658,77 +678,92 @@ sealed class WidgetForm : Form
     void SyncSessions()
     {
         // Claude's per-session registry (files named by PID) is our liveness signal: Claude
-        // drops a session's entry the moment it goes away — even on an abrupt close that skips
-        // SessionEnd — so a .meta with no registry entry means the session is dead.
+        // drops a session's entry the moment it goes away - even on an abrupt close that skips
+        // SessionEnd. It also decides which tiles exist: every live session gets one, whether or
+        // not its hook has written a .meta yet. .meta supplies the auto-approval tally and the
+        // status fallback.
         var reg = LoadRegistry();
         bool regUsable = reg.Count > 0;   // empty => registry unavailable/undocumented-shape-changed; don't prune blind
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
-        List<string> live = new();
-        try
-        {
-            foreach (var f in Directory.GetFiles(SessionsDir, "*.meta"))
-            {
-                var sid = Path.GetFileNameWithoutExtension(f);
-
-                // Liveness is Claude's session registry, full stop: a session Claude once
-                // registered but has since dropped is gone — evict its tile within ~1.5s (no
-                // clean /exit needed, no age timeout). A live session (even idle for days)
-                // stays in the registry, so its tile stays. Require a few consecutive misses
-                // so a mid-write registry blip can't evict a live session; gated on _seenInReg
-                // so a start-up race (a fresh .meta whose registry entry hasn't appeared yet)
-                // is never mistaken for a dead session. When the registry is unavailable
-                // (regUsable false) we never prune — a tile then lingers until the registry
-                // returns (its next tick re-evaluates) or you right-click → Dismiss.
-                if (regUsable && _seenInReg.Contains(sid) && !reg.ContainsKey(sid))
-                {
-                    int n = _regMiss.TryGetValue(sid, out var c) ? c + 1 : 1;
-                    if (n >= RegMissesToPrune) { _regMiss.Remove(sid); DeleteSessionFiles(sid); continue; }
-                    _regMiss[sid] = n;   // keep rendering the tile until the miss budget is spent
-                }
-                else _regMiss.Remove(sid);
-
-                Session s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
-                try
-                {
-                    var text = ReadShared(f);
-                    var m = text != null ? JsonSerializer.Deserialize<MetaDto>(text) : null;
-                    if (m != null) { s.Status = m.status; s.Cwd = m.cwd; s.Count = Math.Max(0, m.count); }
-                }
-                catch { }
-                var st = ReadShared(Path.Combine(SessionsDir, sid + ".state"));
-                s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
-                _sessions[sid] = s;
-                live.Add(sid);
-            }
-        }
+        var metas = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try { foreach (var f in Directory.GetFiles(SessionsDir, "*.meta")) metas[Path.GetFileNameWithoutExtension(f)] = f; }
         catch { }
 
-        // A tile per LIVE session, not per .meta. The shim writes .meta on the first hook event
-        // it sees, so a session whose .meta is missing or late (hooks added after it started, its
-        // tile dismissed, a hook invocation that failed) had NO tile at all even though Claude
-        // lists it as live - which is how two Claudes in one folder could show up as one tile.
-        // The registry already decides when a tile dies; now it decides birth too. .meta stays
-        // the source of the auto-approval tally and of the status fallback.
-        var fresh = new List<KeyValuePair<string, RegInfo>>(reg);
-        fresh.Sort((a, b) => a.Value.StartedAt.CompareTo(b.Value.StartedAt));   // lay new tiles out in launch order
-        foreach (var kv in fresh)
+        // Everything we might show or still owe cleanup: hook-written .meta files, the registry
+        // (in launch order, so new tiles lay out that way), tiles on screen, and dismissals.
+        var byStart = new List<KeyValuePair<string, RegInfo>>(reg);
+        byStart.Sort((x, y) => x.Value.StartedAt.CompareTo(y.Value.StartedAt));
+        var candidates = new List<string>(metas.Keys);
+        foreach (var kv in byStart) candidates.Add(kv.Key);
+        candidates.AddRange(_order);
+        candidates.AddRange(_dismissed);
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var live = new List<string>();
+        foreach (var sid in candidates)
         {
-            var sid = kv.Key;
-            if (live.Contains(sid) || _dismissed.Contains(sid)) continue;
-            var s = _sessions.TryGetValue(sid, out var had) ? had : new Session();
-            if (kv.Value.Cwd.Length > 0) s.Cwd = kv.Value.Cwd;
+            if (!seen.Add(sid)) continue;
+            metas.TryGetValue(sid, out var metaPath);
+
+            // A session the registry has stopped listing is gone: evict it - tile, files (an "on"
+            // .state included) and any dismissal - after a few consecutive misses, so a torn read
+            // of one registry file can't evict (or reorder) a live tile. A fresh .meta from a
+            // session whose registry entry hasn't appeared yet is not a miss (start-up race), but
+            // an OLD .meta never seen in the registry is a ghost from a session that died while
+            // the widget was off. Never prune while the registry is unreadable as a whole.
+            bool missing = regUsable && !reg.ContainsKey(sid)
+                           && (metaPath == null || _seenInReg.Contains(sid) || IsOld(metaPath));
+            if (missing)
+            {
+                int n = _regMiss.TryGetValue(sid, out var c) ? c + 1 : 1;
+                if (n >= RegMissesToPrune)
+                {
+                    _regMiss.Remove(sid);
+                    _dismissed.Remove(sid);
+                    DeleteSessionFiles(sid);
+                    continue;
+                }
+                _regMiss[sid] = n;   // keep rendering the tile until the miss budget is spent
+            }
+            else _regMiss.Remove(sid);
+
+            if (_dismissed.Contains(sid))
+            {
+                if (metaPath == null) continue;   // still dismissed (Dismiss deleted its .meta)
+                _dismissed.Remove(sid);           // it acted since - its tile comes back, as it always did
+            }
+
+            var s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
+            if (metaPath != null)
+            {
+                try
+                {
+                    var text = ReadShared(metaPath);
+                    var m = text != null ? JsonSerializer.Deserialize<MetaDto>(text) : null;
+                    if (m != null) { s.Status = m.status ?? "working"; s.Cwd = m.cwd ?? ""; s.Count = Math.Max(0, m.count); }
+                }
+                catch { }
+            }
+            else if (reg.TryGetValue(sid, out var ri) && ri.Cwd.Length > 0) s.Cwd = ri.Cwd;
             var st = ReadShared(Path.Combine(SessionsDir, sid + ".state"));
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
             _sessions[sid] = s;
             live.Add(sid);
         }
 
-        // Forget a dismissal once that session is gone - or has a .meta again, meaning it acted
-        // since you dismissed it, which is exactly when the tile used to come back. Skipped when
-        // the registry is unreadable, so a blip can't resurrect every dismissed tile.
-        if (_dismissed.Count > 0 && regUsable)
-            _dismissed.RemoveWhere(sid => !reg.ContainsKey(sid) || live.Contains(sid));
+        // Sweep .state files that belong to no session at all (a session that ended while we
+        // weren't tracking it). Only the widget writes .state, and only for a tile, so anything
+        // left over is stale - and a stale "on" is a dormant auto-approve. Throttled; cheap.
+        if (regUsable && ++_stateSweep % 50 == 0)
+        {
+            try
+            {
+                foreach (var f in Directory.GetFiles(SessionsDir, "*.state"))
+                    if (!seen.Contains(Path.GetFileNameWithoutExtension(f))) File.Delete(f);
+            }
+            catch { }
+        }
 
         if (_moved && _hitKind == Hit.Tile) return;   // don't churn order mid reorder-drag
 
@@ -752,6 +787,12 @@ sealed class WidgetForm : Form
             }
             else { kv.Value.Name = ""; kv.Value.LiveStatus = ""; }
         }
+    }
+
+    static bool IsOld(string path)
+    {
+        try { return File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddSeconds(-30); }
+        catch { return false; }
     }
 
     // Read Claude Code's per-session registry (~/.claude/sessions/<pid>.json): maps our
@@ -982,7 +1023,7 @@ sealed class WidgetForm : Form
                 {
                     _dragPos = e.Location;
                     int target = SlotFromX(e.X), cur = _order.IndexOf(_dragSid);
-                    if (target != cur && target >= 0)
+                    if (cur >= 0 && target >= 0 && target != cur)   // cur < 0: its session vanished mid-drag
                     {
                         _order.RemoveAt(cur);
                         _order.Insert(target, _dragSid);
@@ -1007,7 +1048,9 @@ sealed class WidgetForm : Form
             if (!_moved && _hitKind == Hit.Tile && _dragSid != null) ToggleSession(_dragSid);
             else if (_moved)
             {
-                if (_hitKind == Hit.Grip) { EnsureOnScreen(); SetHome(Location); ComputeRel(); }   // you moved it — new home
+                // You moved it - new home. Not when locked: the grip doesn't move a locked strip, and
+                // adopting Location then could save a temporary clamp (e.g. on an RDP screen) as home.
+                if (_hitKind == Hit.Grip && !_locked) { EnsureOnScreen(); SetHome(Location); ComputeRel(); }
                 SaveConfig();
             }
         }
@@ -1172,7 +1215,13 @@ sealed class WidgetForm : Form
                         if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
                     foreach (var sid in c.Dismissed ?? new List<string>())
                         if (!string.IsNullOrWhiteSpace(sid)) _dismissed.Add(sid);
-                    if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); _homeW = Math.Max(0, c.HomeW); Location = _home; }
+                    // HomeSet, or (legacy configs, which used -1 for "unset") non-negative coords.
+                    if (c.HomeSet || (c.X >= 0 && c.Y >= 0))
+                    {
+                        _home = new Point(c.X, c.Y); _homeSet = true;
+                        _homeW = double.IsFinite(c.HomeW) ? Math.Max(0, c.HomeW) : 0;
+                        Location = _home;
+                    }
                     _relRight = c.HomeRight; _relBottom = c.HomeBottom;
                     _relGapX = c.HomeGapX; _relGapY = c.HomeGapY;
                     _relValid = c.HomeGapX >= 0 && c.HomeGapY >= 0;
@@ -1188,12 +1237,12 @@ sealed class WidgetForm : Form
         try
         {
             Directory.CreateDirectory(HookerDir);
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(new WidgetConfig
+            WriteAtomic(ConfigPath, JsonSerializer.Serialize(new WidgetConfig
             {
                 // Persist _home, never the live Location — the live one may be a temporary
                 // clamp to stay visible while a monitor is missing, which must not become the
                 // remembered spot.
-                X = _home.X, Y = _home.Y, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
+                X = _home.X, Y = _home.Y, HomeSet = _homeSet, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
                 Anchor = _anchor, NewSide = _newSide, Order = new(_order), Dismissed = new(_dismissed),
                 HomeRight = _relRight, HomeBottom = _relBottom,
                 HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,

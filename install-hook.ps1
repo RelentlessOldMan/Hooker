@@ -9,6 +9,11 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Hooker's own entries: any command ending in dist/hook.exe, wherever the folder lives - so a
+# re-install from a moved or newer release folder replaces the old entry instead of leaving
+# both registered (both would run on every event).
+function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe$' }
+
 $settings = Join-Path $env:USERPROFILE '.claude\settings.json'
 $hookExe  = Join-Path $PSScriptRoot 'dist\hook.exe'
 
@@ -24,7 +29,9 @@ if (Test-Path $settings) {
     # Timestamped so re-running never clobbers an earlier good backup.
     $backup = "$settings.hooker-backup-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
     Copy-Item $settings $backup -Force
-    $json = Get-Content $settings -Raw | ConvertFrom-Json
+    # -Encoding UTF8: Windows PowerShell 5.1 otherwise reads a BOM-less file as the ANSI
+    # codepage and would mangle any non-ASCII text in your settings on the way back out.
+    $json = Get-Content $settings -Raw -Encoding UTF8 | ConvertFrom-Json
     Write-Host "Backed up existing settings to $backup"
 } else {
     New-Item -ItemType Directory -Force -Path (Split-Path $settings) | Out-Null
@@ -54,7 +61,7 @@ try {
         if ($json.hooks.PSObject.Properties.Name -contains $e) {
             # Keep hooks you already had for this event; drop only a prior Hooker entry.
             $kept = @($json.hooks.$e | Where-Object {
-                -not ($_.hooks | Where-Object { $_.command -eq $hookExe })
+                -not ($_.hooks | Where-Object { Test-HookerCommand $_.command })
             })
             $json.hooks.$e = @($kept + $ourGrp)
         } else {
@@ -65,9 +72,9 @@ try {
     # Write BOM-less UTF-8 (Set-Content -Encoding utf8 adds a BOM on Windows PowerShell 5.1)
     # to a temp file, verify it parses as JSON, then swap it in - so a bad write can never
     # leave the live settings.json corrupt.
-    $out = $json | ConvertTo-Json -Depth 10
+    $out = $json | ConvertTo-Json -Depth 100   # deep enough that nothing of yours gets flattened
     [System.IO.File]::WriteAllText($tmp, $out, (New-Object System.Text.UTF8Encoding $false))
-    $null = Get-Content $tmp -Raw | ConvertFrom-Json   # validate before replacing
+    $null = Get-Content $tmp -Raw -Encoding UTF8 | ConvertFrom-Json   # validate before replacing
     Move-Item $tmp $settings -Force
 }
 catch {

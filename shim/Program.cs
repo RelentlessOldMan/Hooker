@@ -1,9 +1,9 @@
 // Hooker shim — one exe wired to several Claude Code hook events, now PER SESSION.
 // Claude runs it once per event and reads its stdout. Two jobs:
 //
-//   1. PreToolUse: if THIS session is "hooking" (its .state file says on), print an
-//      allow decision so its prompts auto-approve. Otherwise print nothing / exit 0,
-//      leaving Claude's normal behaviour untouched.
+//   1. PreToolUse: if THIS session is "hooking" (its .state file says on) AND the widget is
+//      running, print an allow decision so its prompts auto-approve. Otherwise print nothing /
+//      exit 0, leaving Claude's normal behaviour untouched.
 //
 //   2. Per-session status: translate lifecycle events into each session's .meta file
 //      (status working/waiting, cwd, auto-approval count) that the widget renders.
@@ -43,7 +43,7 @@ try
 {
     var stdin = Console.In.ReadToEnd();
 
-    string evt = "", tool = "", sid = "", cwd = "";
+    string evt = "", tool = "", sid = "", cwd = "", source = "";
     try
     {
         using var doc = JsonDocument.Parse(stdin);
@@ -52,6 +52,7 @@ try
         if (root.TryGetProperty("tool_name", out var t)) tool = t.GetString() ?? "";
         if (root.TryGetProperty("session_id", out var s)) sid = s.GetString() ?? "";
         if (root.TryGetProperty("cwd", out var c)) cwd = c.GetString() ?? "";
+        if (root.TryGetProperty("source", out var so)) source = so.GetString() ?? "";   // SessionStart: startup|resume|clear|compact
     }
     catch { /* no/invalid payload */ }
 
@@ -67,7 +68,9 @@ try
     {
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            // FileShare.Delete too, so a concurrent rename-over (File.Move overwrite) of this file
+            // by the widget or another shim isn't blocked by our open handle.
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
             return sr.ReadToEnd();
         }
@@ -101,29 +104,69 @@ try
         }
         catch { }
     }
-    void SetStatus(string status, bool bump = false)
+    // Claude fires tool hooks in parallel, so several shims can read-modify-write the same .meta
+    // at once and lose an auto-approval count. Serialise per session with a named mutex; if it
+    // can't be had quickly, carry on unlocked rather than ever stall Claude.
+    void UpdateMeta(Action<Meta> change)
     {
-        var m = ReadMeta();
+        Mutex? mx = null;
+        bool held = false;
+        try
+        {
+            mx = new Mutex(false, "Hooker.Meta." + sid);
+            try { held = mx.WaitOne(500); } catch (AbandonedMutexException) { held = true; }
+        }
+        catch { }
+        try
+        {
+            var m = ReadMeta();
+            change(m);
+            WriteMeta(m);
+        }
+        finally
+        {
+            if (held) try { mx!.ReleaseMutex(); } catch { }
+            mx?.Dispose();
+        }
+    }
+    void SetStatus(string status, bool bump = false) => UpdateMeta(m =>
+    {
         m.status = status;
         if (cwd.Length > 0) m.cwd = cwd;
         if (bump) m.count += 1;
-        WriteMeta(m);
-    }
+    });
+    // Auto-approve needs BOTH this session's .state = "on" AND a running widget (it holds this
+    // named mutex for its whole life). The widget turns sessions off when it exits cleanly, but a
+    // crash or kill skips that - so a widget that isn't running grants nothing, whatever the
+    // files on disk say. Any failure here also means "not hooking": fail safe, to normal prompts.
     bool Hooking()
     {
         var t = ReadShared(statePath);
-        return t != null && t.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
+        if (t == null || !t.Trim().Equals("on", StringComparison.OrdinalIgnoreCase)) return false;
+        try
+        {
+            if (!Mutex.TryOpenExisting("Hooker.Widget.SingleInstance", out var widget)) return false;
+            widget.Dispose();
+            return true;
+        }
+        catch { return false; }
     }
 
     switch (evt)
     {
         case "SessionStart":
-            // New (or resumed) session: it's awaiting your first prompt; reset the tally.
-            var start = ReadMeta();
-            start.status = "waiting";
-            if (cwd.Length > 0) start.cwd = cwd;
-            start.count = 0;
-            WriteMeta(start);
+            // Awaiting your first prompt. A NEW or RESUMED session (a fresh Claude process) starts
+            // manual with a fresh tally: a resumed session keeps its old id, and must not come back
+            // already on autopilot from a .state its previous run left behind. /clear and
+            // auto-compact are the same running session, so they keep hooking and the count.
+            bool fresh = source is not ("clear" or "compact");
+            if (fresh) { try { File.Delete(statePath); } catch { } }
+            UpdateMeta(m =>
+            {
+                m.status = "waiting";
+                if (cwd.Length > 0) m.cwd = cwd;
+                if (fresh) m.count = 0;
+            });
             break;
 
         case "UserPromptSubmit":

@@ -105,9 +105,15 @@ sealed class SystemMeter : IDisposable
 {
     const int PeriodMs = 1000;
 
-    readonly object _gate = new();
+    // Two locks so the UI thread never waits out a sample: _timerLock guards the timer and is
+    // only ever held briefly (Start/Stop from the menu, re-arming); _sampleLock serialises the
+    // sampling itself and the PDH query's lifetime.
+    readonly object _timerLock = new();
+    readonly object _sampleLock = new();
     System.Threading.Timer? _timer;
-    bool _disposed, _inited;
+    volatile bool _disposed;
+    volatile bool _needPrime;   // take a baseline instead of publishing (first sample, or after a pause)
+    bool _inited;
     MeterSnapshot? _latest;
 
     // Newest sample, or null before the first one (or while stopped).
@@ -119,16 +125,17 @@ sealed class SystemMeter : IDisposable
 
     public void Start()
     {
-        lock (_gate)
+        lock (_timerLock)
         {
             if (_disposed || _timer != null) return;
+            _needPrime = true;
             _timer = new System.Threading.Timer(Run, null, 0, Timeout.Infinite);
         }
     }
 
     public void Stop()
     {
-        lock (_gate)
+        lock (_timerLock)
         {
             _timer?.Dispose();
             _timer = null;
@@ -138,12 +145,16 @@ sealed class SystemMeter : IDisposable
 
     public void Dispose()
     {
-        lock (_gate)
+        lock (_timerLock)
         {
             if (_disposed) return;
             _disposed = true;
             _timer?.Dispose();
             _timer = null;
+        }
+        // At shutdown it's fine to wait for an in-flight sample before closing the query.
+        lock (_sampleLock)
+        {
             if (_query != IntPtr.Zero) { try { PdhCloseQuery(_query); } catch { } _query = IntPtr.Zero; }
         }
     }
@@ -151,17 +162,23 @@ sealed class SystemMeter : IDisposable
     // One-shot timer re-armed after each sample, so a slow sample can never overlap the next.
     void Run(object? _)
     {
-        bool fresh = false;
-        lock (_gate)
+        lock (_timerLock) { if (_timer == null) return; }   // stopped while this callback was queued
+
+        MeterSnapshot? snap = null;
+        lock (_sampleLock)
         {
-            if (_timer == null) return;   // stopped while this callback was queued
-            if (!Paused)
-            {
-                try { Volatile.Write(ref _latest, Sample()); fresh = true; } catch { }
-            }
+            if (_disposed) return;
+            if (Paused) _needPrime = true;   // on resume: fresh baseline, not one rate averaged over the pause
+            else try { snap = Sample(); } catch { }
+        }
+
+        lock (_timerLock)
+        {
+            if (_timer == null) return;      // stopped mid-sample: don't publish into a stopped meter
+            if (snap != null) Volatile.Write(ref _latest, snap);
             _timer.Change(PeriodMs, Timeout.Infinite);
         }
-        if (fresh) try { Sampled?.Invoke(); } catch { }
+        if (snap != null) try { Sampled?.Invoke(); } catch { }
     }
 
     // ---- sampling ---------------------------------------------------------
@@ -174,6 +191,9 @@ sealed class SystemMeter : IDisposable
     readonly List<Adapter> _adapters = new();
     // Extra LUIDs that are just another view of a real card (see EnumGpus) -> that card's LUID.
     readonly Dictionary<ulong, ulong> _alias = new();
+    // Engine LUIDs DXGI still doesn't list after a re-enumeration (e.g. an NPU): not a GPU we can
+    // name, so stop re-enumerating on their account.
+    readonly HashSet<ulong> _unnamed = new();
     ulong Owner(ulong luid) => _alias.TryGetValue(luid, out var o) ? o : luid;
     int _gpuEnumAge;
 
@@ -182,7 +202,7 @@ sealed class SystemMeter : IDisposable
     readonly Dictionary<string, (long rx, long tx)> _netPrev = new();
     long _netPrevTs;
     HashSet<string> _gatewayIds = new();
-    int _gwAge = int.MaxValue;
+    int _gwAge = 30;   // due on the first sample (was int.MaxValue, whose ++ wrapped negative: never refreshed)
 
     void Init()
     {
@@ -219,9 +239,21 @@ sealed class SystemMeter : IDisposable
     IntPtr AddCounter(string path) =>
         PdhAddEnglishCounter(_query, path, IntPtr.Zero, out var c) == 0 ? c : IntPtr.Zero;
 
-    MeterSnapshot Sample()
+    MeterSnapshot? Sample()
     {
         if (!_inited) Init();
+        if (_needPrime)
+        {
+            // Rate counters (CPU, GPU engines) and the network deltas need a baseline: take one now
+            // and publish from the next tick, instead of a junk value computed over microseconds
+            // (first sample) or averaged over a whole pause (resume).
+            _needPrime = false;
+            try { if (_query != IntPtr.Zero) PdhCollectQueryData(_query); } catch { }
+            _netPrevTs = 0;
+            _netPrev.Clear();
+            try { SampleNetwork(new MeterSnapshot()); } catch { }
+            return null;
+        }
         var s = new MeterSnapshot
         {
             CpuName = _cpuName,
@@ -293,9 +325,9 @@ sealed class SystemMeter : IDisposable
     // ---- GPU ---------------------------------------------------------------
 
     // Instance names look like "pid_1234_luid_0x00000000_0x0000C6E7_phys_0_eng_3_engtype_3D".
-    static readonly Regex EngRx = new(@"luid_0x([0-9a-f]+)_0x([0-9a-f]+)_phys_(\d+)_eng_(\d+)",
+    static readonly Regex EngRx = new(@"luid_0x([0-9a-f]{1,8})_0x([0-9a-f]{1,8})_phys_(\d+)_eng_(\d+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    static readonly Regex LuidRx = new(@"luid_0x([0-9a-f]+)_0x([0-9a-f]+)",
+    static readonly Regex LuidRx = new(@"luid_0x([0-9a-f]{1,8})_0x([0-9a-f]{1,8})",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     static ulong LuidKey(string hi, string lo) => (Convert.ToUInt64(hi, 16) << 32) | Convert.ToUInt32(lo, 16);
@@ -322,8 +354,15 @@ sealed class SystemMeter : IDisposable
         // A LUID we can't name means the adapter set changed (driver update/reset) - re-enumerate,
         // throttled so a permanently unmatched adapter can't make us do it every second.
         bool unmatched = false;
-        foreach (var luid in util.Keys) if (!_adapters.Exists(a => a.Luid == luid)) unmatched = true;   // keys are owners already
-        if ((unmatched || _adapters.Count == 0) && ++_gpuEnumAge >= 30) { _gpuEnumAge = 0; EnumGpus(); }
+        foreach (var luid in util.Keys)   // keys are owners already
+            if (!_unnamed.Contains(luid) && !_adapters.Exists(a => a.Luid == luid)) unmatched = true;
+        if ((unmatched || _adapters.Count == 0) && ++_gpuEnumAge >= 30)
+        {
+            _gpuEnumAge = 0;
+            EnumGpus();
+            foreach (var luid in util.Keys)
+                if (!_alias.ContainsKey(luid) && !_adapters.Exists(a => a.Luid == luid)) _unnamed.Add(luid);
+        }
 
         var ded = SumByLuid(Values(_cGpuDed), Owner);
         var shared = SumByLuid(Values(_cGpuShared), Owner);

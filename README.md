@@ -61,7 +61,14 @@ Tiles come from the registry too: every live session gets a tile even if its hoo
 
 **Hooking is a permission bypass.** When a session's tile is salmon (hooking), Hooker **auto-approves every `PreToolUse` prompt** for that session — Bash commands, file writes/edits, network, memory writes, MCP tools, everything — with no confirmation. A session on autopilot has Claude's approval gate **turned off**, so a bad or prompt-injected instruction could run destructive or exfiltrating commands unattended.
 
-Mitigations baked in: hooking is **off by default**, per session, and every session is forced back to **off when the widget exits**. Only turn a tile salmon when you trust what that session is doing. If in doubt, leave it grey and approve normally.
+Mitigations baked in:
+- Hooking is **off by default**, per session.
+- **Autopilot only exists while the widget is running.** `hook.exe` auto-approves only if the session is switched on *and* the widget is alive, so a crashed or killed widget grants nothing, whatever is left on disk. A clean exit also switches every session off.
+- **Every widget start begins with all sessions manual.** That includes a restart after a crash or an update, so autopilot never outlives the widget run that granted it; turn tiles back on deliberately.
+- **A resumed session starts manual.** `claude --resume` keeps the old session id, so its previous run's switch is cleared at startup. `/clear` and auto-compact keep the session's setting.
+- Switches belonging to sessions that have ended are deleted, and **uninstall** clears them all.
+
+Only turn a tile salmon when you trust what that session is doing. If in doubt, leave it grey and approve normally.
 
 ## How it works
 
@@ -72,7 +79,7 @@ hooks  (hook.exe)         --writes--> ...\.claude\hooker\sessions\<sid>.meta    
 ```
 
 `hook.exe` is registered on six Claude events, all per session:
-- `SessionStart` → new tile (waiting), count reset
+- `SessionStart` → new tile (waiting); on a new or resumed session also count reset + hooking off (`/clear` and compact keep both)
 - `UserPromptSubmit` / `PreToolUse` → working (`PreToolUse` auto-approves + bumps the count when that session is hooking)
 - `AskUserQuestion` (a `PreToolUse`) → waiting (Claude needs you to pick)
 - `Stop`, `Notification` → waiting
@@ -105,7 +112,7 @@ powershell -ExecutionPolicy Bypass -File .\install-hook.ps1   # register hooks (
 ```
 Restart Claude and run `dist\HookerWidget.exe`.
 
-> **Moved or re-cloned the folder?** The hook command is an absolute path in `settings.json`, so re-run the installer after moving `hook.exe`.
+> **Moved or re-cloned the folder?** The hook command is an absolute path in `settings.json`, so re-run the installer after moving `hook.exe` (it replaces the old entry rather than adding a second one).
 
 ## Contributing
 
@@ -136,7 +143,7 @@ Hooker/
   docs/mockup.py          -> promo images
   shim/                   hook.exe         (.NET console, per-session state)
   tray/                   HookerWidget.exe (.NET WinForms floating widget; SystemMeter.cs = the meter)
-  dist/                   built exes + settings-hooks-snippet.json
+  dist/                   built exes
   build.ps1  install-hook.ps1  uninstall-hook.ps1  "Install Hooker.cmd"
 ```
 

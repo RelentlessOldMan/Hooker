@@ -17,6 +17,8 @@ $dirty = git status --porcelain
 if ($dirty) { throw "Working tree not clean - commit or stash your changes first, then re-run." }
 gh auth status *> $null
 if ($LASTEXITCODE -ne 0) { throw "gh is not authenticated - run 'gh auth login' first." }
+$branch = (git rev-parse --abbrev-ref HEAD | Out-String).Trim()
+if ($branch -ne 'main') { throw "Releases are cut from main; you're on '$branch'." }
 
 # 2. Decide the new version: explicit -Version, else bump the patch.
 $verFile = Join-Path $PSScriptRoot 'VERSION'
@@ -33,6 +35,7 @@ Write-Host "Releasing v$cur -> v$ver"
 $wasRunning = [bool](Get-Process HookerWidget -ErrorAction SilentlyContinue)
 Stop-Process -Name HookerWidget -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
+try {   # finally (at the end) relaunches the widget whether the release succeeds or fails
 
 # 4. Write the new version, then build + package + checksums. If ANY of this fails, roll
 #    VERSION back so a failed release never leaves a half-bumped, uncommitted file behind,
@@ -62,13 +65,19 @@ catch {
     Set-Content $verFile $cur -Encoding ascii -NoNewline    # roll the bump back
     Remove-Item $zip, $sums -ErrorAction SilentlyContinue
     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
-    if ($wasRunning) { Start-Process "$PSScriptRoot\dist\HookerWidget.exe" }
     throw "Release aborted before any commit; VERSION restored to $cur. $_"
 }
 
 # 5. Commit the bump and push -- only now that a good build + package exist.
 git add VERSION
-git commit --quiet -m "Release v$ver"
+if ($LASTEXITCODE -eq 0) { git commit --quiet -m "Release v$ver" }
+if ($LASTEXITCODE -ne 0) {
+    # Nothing is published yet: undo the bump so the tree is back where it started.
+    git reset --quiet -- VERSION
+    Set-Content $verFile $cur -Encoding ascii -NoNewline
+    Remove-Item $zip, $sums -ErrorAction SilentlyContinue
+    throw "git add/commit failed (a hook?); VERSION restored to $cur and nothing was pushed."
+}
 git push --quiet origin main
 if ($LASTEXITCODE -ne 0) {
     throw "git push failed - the 'Release v$ver' commit is local. Fix the remote, 'git push', then finish with: gh release create v$ver `"$zip`" `"$sums`" --title `"Hooker v$ver`" --notes-file <notes>"
@@ -90,8 +99,9 @@ Verify your download against `SHA256SUMS.txt`.
 WARNING: putting a session on autopilot (salmon tile) auto-approves every prompt for it - read the README security note first.
 '@
 $notesFile = Join-Path $env:TEMP "hooker-relnotes-$ver.md"
-Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8
-gh release create "v$ver" "$zip" "$sums" --title "Hooker v$ver" --notes-file $notesFile
+[System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding $false))   # no BOM
+$head = (git rev-parse HEAD | Out-String).Trim()
+gh release create "v$ver" "$zip" "$sums" --title "Hooker v$ver" --notes-file $notesFile --target $head
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "v$ver was committed & pushed, but 'gh release create' failed."
     Write-Warning "Finish manually: gh release create v$ver `"$zip`" `"$sums`" --title `"Hooker v$ver`" --notes-file `"$notesFile`""
@@ -102,6 +112,11 @@ Remove-Item $notesFile -Force -ErrorAction SilentlyContinue
 # 7. Clean up and relaunch the widget if it had been running.
 Remove-Item $zip, $sums -ErrorAction SilentlyContinue
 Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
-if ($wasRunning) { Start-Process "$PSScriptRoot\dist\HookerWidget.exe" }
 
 Write-Host "`nReleased v$ver -> https://github.com/RelentlessOldMan/Hooker/releases/tag/v$ver"
+}
+finally {
+    if ($wasRunning -and -not (Get-Process HookerWidget -ErrorAction SilentlyContinue)) {
+        Start-Process "$PSScriptRoot\dist\HookerWidget.exe"
+    }
+}
