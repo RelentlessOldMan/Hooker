@@ -740,6 +740,13 @@ sealed class WidgetForm : Form
                 _dismissed.Remove(sid);           // it acted since - its tile comes back, as it always did
             }
 
+            // `claude -r` registers a placeholder while its pick-a-session list is up: a throwaway id
+            // with no status, and no hook has fired. Picking swaps the real id into that same entry.
+            // Tile a session only once it's actually running - it has a status (a new session gets
+            // one within a second) or its hook has written - so the list doesn't flash a tile.
+            if (metaPath == null && !_sessions.ContainsKey(sid)
+                && reg.TryGetValue(sid, out var pre) && pre.Status.Length == 0) continue;
+
             var s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
             if (metaPath != null)
             {
@@ -815,6 +822,7 @@ sealed class WidgetForm : Form
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "sessions");
             if (!Directory.Exists(dir)) return map;
             var files = Directory.GetFiles(dir, "*.json");
+            int parsed = 0;
             foreach (var f in files)
             {
                 try
@@ -828,6 +836,13 @@ sealed class WidgetForm : Form
                     // The id names our files: accept only what the shim's Sanitize() leaves unchanged, so
                     // both agree on file names and nothing can point outside the sessions folder.
                     if (string.IsNullOrEmpty(sid) || !SafeId(sid)) continue;
+                    parsed++;
+                    // A killed or crashed Claude leaves its entry behind (only a clean exit removes
+                    // it), so check the process is really still there.
+                    long pid = r.TryGetProperty("pid", out var pe) && pe.TryGetInt64(out var pv) ? pv : 0;
+                    long procStart = r.TryGetProperty("procStart", out var ps) && ps.ValueKind == JsonValueKind.String
+                                     && long.TryParse(ps.GetString(), out var pst) ? pst : 0;
+                    if (pid > 0 && !ProcessAlive(pid, procStart)) continue;
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
@@ -837,11 +852,34 @@ sealed class WidgetForm : Form
                 }
                 catch { }
             }
-            usable = files.Length == 0 || map.Count > 0;
+            usable = files.Length == 0 || parsed > 0;   // all-dead is still a readable registry
         }
         catch { }
         return map;
     }
+
+    // Is this pid still the process that wrote the entry? procStart is its creation time (FILETIME,
+    // matches GetProcessTimes exactly), which catches a recycled pid. Anything we can't determine
+    // counts as alive - this only ever drops entries we're sure about.
+    static bool ProcessAlive(long pid, long procStart)
+    {
+        if (pid > uint.MaxValue) return true;
+        var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        if (h == IntPtr.Zero) return Marshal.GetLastWin32Error() != ERROR_INVALID_PARAMETER;   // 87 = no such process
+        try
+        {
+            if (GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE) return false;
+            if (procStart != 0 && GetProcessTimes(h, out long created, out _, out _, out _) && created != procStart) return false;
+            return true;
+        }
+        finally { CloseHandle(h); }
+    }
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, STILL_ACTIVE = 259;
+    const int ERROR_INVALID_PARAMETER = 87;
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 
     static bool SafeId(string sid)
     {

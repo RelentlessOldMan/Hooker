@@ -49,9 +49,9 @@ It stays **in front of the taskbar**, **hides** while a fullscreen app owns the 
 
 ### Stale tiles
 
-A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it (which Claude does even on an abrupt close), its tile is **evicted within ~1.5s**. Liveness is driven purely by that registry — a session that's *there* keeps its tile (even if it sits idle for days), and one that's *gone* loses it; there is no age-based timeout. If the registry is ever unavailable, tiles are left in place until it returns (self-healing: a live session's next hook event refreshes its tile) — and right-click → **Dismiss** clears one instantly.
+A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it — or its entry's process is gone (a killed Claude leaves its entry behind, so the widget checks the process itself, PID reuse included) — its tile is **evicted within ~1.5s**. Liveness is driven purely by that registry — a session that's *there* keeps its tile (even if it sits idle for days), and one that's *gone* loses it; there is no age-based timeout. If the registry is ever unavailable, tiles are left in place until it returns (self-healing: a live session's next hook event refreshes its tile) — and right-click → **Dismiss** clears one instantly.
 
-Tiles come from the registry too: every live session gets a tile even if its hook hasn't fired yet (e.g. it was started before Hooker was installed), and a **Dismiss**ed tile stays dismissed until that session does something again or ends.
+Tiles come from the registry too: every live session gets a tile even if its hook hasn't fired yet (e.g. it was started before Hooker was installed), and a **Dismiss**ed tile stays dismissed until that session does something again or ends. `claude -r`'s pick-a-session list gets no tile: while it's up, Claude registers only a placeholder (no status, no hook yet), and the tile appears once you pick.
 
 ### Multi-monitor & display changes
 
