@@ -3,12 +3,18 @@
 //   left-click a tile      : toggle that session's hooking (salmon = auto, grey = manual)
 //   drag a tile            : reorder it (works whether or not position is locked)
 //   drag the grip (left)   : move the whole widget  (only when position is UNLOCKED)
-//   right-click            : menu -> Dismiss, Lock position, new-session side, grow dir, Exit
+//   right-click            : menu -> Dismiss, Lock position, System meter, new-session side, grow dir, Exit
 //
 // Two axes per tile: background = needs-you (green = waiting on you, yellow = working),
 // mascot = enabled (salmon = hooking/auto-approve, grey = manual). Auto-approve is per
 // session and lives entirely in the shim; this widget just writes each session's on/off
-// .state and reads its .meta + Claude's session registry (for /name and live busy) to render.
+// .state and reads Claude's session registry (which sessions exist, /name, live busy)
+// plus each session's hook-written .meta (auto-approval tally) to render.
+//
+// System meter (toggle in the right-click menu): the left-most "two tiles" are live vertical
+// bars (no labels) of Task Manager's Performance numbers - CPU, Memory, Network, GPU - with detail
+// (speeds, cores, memory, GPU temp...) on hover. It's fixed in place: always first, never
+// draggable, never a drop target. Sampling lives in SystemMeter.cs.
 //
 // Growth: when tiles are added/removed the strip keeps one edge pinned. "Anchor"
 // picks which edge (auto = whichever screen half the widget sits on) so a
@@ -48,6 +54,7 @@ sealed class Session
     public bool Hooking;                 // salmon vs grey mascot
     public string Name = "";             // /name title, from Claude's session registry
     public string LiveStatus = "";       // Claude's own status for the session ("busy"/"idle"/...), "" if not in registry
+    public long StartedAt;               // registry startedAt (ms); 0 if unknown. Orders same-name tiles.
 
     // Claude's live registry status is authoritative when present: it's updated
     // continuously, so "idle" reliably clears once a turn ends. Our hook .meta is only
@@ -74,6 +81,17 @@ sealed class WidgetConfig
     public bool HomeBottom { get; set; } = true;
     public double HomeGapX { get; set; } = -1;
     public double HomeGapY { get; set; } = -1;
+
+    // Sessions you dismissed that are still live: without this a restart would bring every
+    // dismissed tile straight back, since tiles are built from Claude's session registry.
+    public List<string> Dismissed { get; set; } = new();
+
+    public bool Meter { get; set; } = true;   // show the system meter (on unless you turn it off)
+
+    // Strip width when X/Y was captured (0 = legacy/unknown). X/Y is a top-left corner, so if the
+    // strip comes back a different width (sessions came/went, meter toggled) a right-anchored
+    // strip must shift by the difference to keep its RIGHT edge where you put it.
+    public int HomeW { get; set; }
 }
 
 sealed class WidgetForm : Form
@@ -111,17 +129,21 @@ sealed class WidgetForm : Form
     readonly ContextMenuStrip _menu = new();
     ToolStripMenuItem _lockItem = null!, _newRight = null!, _newLeft = null!,
                       _anchorAuto = null!, _anchorRight = null!, _anchorLeft = null!,
-                      _newSideMenu = null!, _anchorMenu = null!, _exitItem = null!;
+                      _newSideMenu = null!, _anchorMenu = null!, _exitItem = null!, _meterItem = null!;
 
     readonly List<string> _order = new();
     readonly Dictionary<string, Session> _sessions = new();
     readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
+    readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // sids you dismissed; suppressed until they act again or die
+    bool _meterOn = true;                       // the left "two-tile" system meter
+    readonly SystemMeter _meter = new();
     bool _locked;
     string _anchor = "auto";
     string _newSide = "right";
     Point _home = new(-1, -1);   // the spot you chose (persisted); we always return here, and only
                                  // ever clamp *off* it temporarily to stay visible — never saving that.
+    int _homeW;                  // strip width when _home was captured; see RebaseHome
     bool _relValid;              // edge-relative spec of _home captured (which corner + logical gap)
     bool _relRight, _relBottom = true;
     double _relGapX, _relGapY;
@@ -134,7 +156,7 @@ sealed class WidgetForm : Form
     const int LogCap = 400;
     readonly Queue<string> _log = new();
 
-    enum Hit { None, Grip, Tile }
+    enum Hit { None, Grip, Meter, Tile }
     Hit _hitKind;
     string? _dragSid;
     bool _moved;
@@ -176,6 +198,18 @@ sealed class WidgetForm : Form
         _poll = new System.Windows.Forms.Timer { Interval = 100 };
         _poll.Tick += (_, _) => Tick();
         _poll.Start();
+
+        // The meter samples on a thread-pool timer; each fresh sample just repaints its tile.
+        _meter.Sampled += () =>
+        {
+            try
+            {
+                if (IsHandleCreated && !IsDisposed)
+                    BeginInvoke(new Action(() => { if (_meterOn && Visible) Invalidate(MeterRect()); }));
+            }
+            catch { }   // racing shutdown
+        };
+        if (_meterOn) _meter.Start();
 
         // Re-assert topmost the instant the foreground window changes (e.g. pressing Win
         // raises the taskbar/Start), so the shell can't jump in front of us.
@@ -236,6 +270,7 @@ sealed class WidgetForm : Form
         _anchorMenu = new ToolStripMenuItem("Grow direction");
         _anchorMenu.DropDownItems.AddRange(new ToolStripItem[] { _anchorAuto, _anchorRight, _anchorLeft });
 
+        _meterItem = new ToolStripMenuItem("System meter", null, (_, _) => ToggleMeter());
         _exitItem = new ToolStripMenuItem("Exit", null, (_, _) => Close());
     }
 
@@ -248,11 +283,12 @@ sealed class WidgetForm : Form
         _menu.Items.Add(new ToolStripSeparator());
         if (tileSid != null && _sessions.ContainsKey(tileSid))
         {
-            _menu.Items.Add(new ToolStripMenuItem($"Dismiss “{FolderOf(tileSid)}”",
+            _menu.Items.Add(new ToolStripMenuItem($"Dismiss “{Label(tileSid)}”",
                 null, (_, _) => DismissSession(tileSid)));
             _menu.Items.Add(new ToolStripSeparator());
         }
         _menu.Items.Add(_lockItem);
+        _menu.Items.Add(_meterItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_newSideMenu);
         _menu.Items.Add(_anchorMenu);
@@ -264,8 +300,24 @@ sealed class WidgetForm : Form
         _menu.Show(this, p);
     }
 
-    string FolderOf(string sid) =>
-        _sessions.TryGetValue(sid, out var s) ? DisplayName(s) : "session";
+    // What a tile is called. Two sessions in the SAME folder with no /name render the same
+    // DisplayName, which makes their tiles impossible to tell apart - so when labels clash we
+    // number them by launch order: (1) is the one you started first. Giving a session a /name
+    // is still the better fix; this just keeps the folder fallback honest.
+    string Label(string sid)
+    {
+        if (!_sessions.TryGetValue(sid, out var s)) return "session";
+        var name = DisplayName(s);
+        int clashes = 0, rank = 1;
+        foreach (var o in _order)
+        {
+            if (o == sid || !_sessions.TryGetValue(o, out var t) || DisplayName(t) != name) continue;
+            clashes++;
+            // Tie-break on sid as well so the numbering can't flip between ticks.
+            if (t.StartedAt < s.StartedAt || (t.StartedAt == s.StartedAt && string.CompareOrdinal(o, sid) < 0)) rank++;
+        }
+        return clashes == 0 ? name : $"{name} ({rank})";
+    }
 
     void DeleteSessionFiles(string sid)
     {
@@ -275,6 +327,7 @@ sealed class WidgetForm : Form
 
     void DismissSession(string sid)
     {
+        _dismissed.Add(sid);   // the session is still live, so without this the tile returns next tick
         DeleteSessionFiles(sid);
         _regMiss.Remove(sid);
         _order.Remove(sid);
@@ -286,6 +339,7 @@ sealed class WidgetForm : Form
     void RefreshMenuChecks()
     {
         _lockItem.Text = _locked ? "Unlock position" : "Lock position";
+        _meterItem.Checked = _meterOn;
         _newRight.Checked = _newSide == "right";
         _newLeft.Checked = _newSide == "left";
         _anchorAuto.Checked = _anchor == "auto";
@@ -297,10 +351,11 @@ sealed class WidgetForm : Form
 
     Size ContentSize()
     {
-        int count = _order.Count;
-        int w = count == 0
+        // The meter counts as two tile slots, so it's exactly two tiles + the gap between them.
+        int slots = _order.Count + (_meterOn ? MeterSlots : 0);
+        int w = slots == 0
             ? Pad * 2 + Grip
-            : Pad * 2 + Grip + Gap + count * Tile + (count - 1) * Gap;
+            : Pad * 2 + Grip + Gap + slots * Tile + (slots - 1) * Gap;
         return new Size(w, Pad * 2 + Tile);
     }
 
@@ -308,12 +363,14 @@ sealed class WidgetForm : Form
     {
         Size = ContentSize();
         if (Location.X < 0 || Location.Y < 0) DockDefault();
-        if (_home.X < 0) _home = Location;   // first run / legacy config with no saved spot
+        if (_home.X < 0) SetHome(Location);  // first run / legacy config with no saved spot
+        RebaseHome();                        // came back a different width than when home was saved
+        if (_home.X >= 0) Location = _home;
         EnsureOnScreen();                    // clamp only the live position; _home is the truth
         if (HomeFitsSomeScreen()) ComputeRel();   // capture/refresh the edge-relative spec (also migrates legacy configs)
         UpdateRegion();
         _screenSig = ScreenSig();            // baseline; Tick reconciles when this later changes
-        Visible = _order.Count > 0 && !ShouldHideForFullscreen();
+        Visible = (_order.Count > 0 || _meterOn) && !ShouldHideForFullscreen();
         Invalidate();
     }
 
@@ -332,9 +389,10 @@ sealed class WidgetForm : Form
             // idle tick reconciles once the drag ends, instead of snapping home mid-drag.
             if (scr != _screenSig && !_moved) { _screenSig = scr; ReconcileDisplay("topology-poll"); }
 
-            if (ShouldHideForFullscreen() || _order.Count == 0)
+            if (ShouldHideForFullscreen() || (_order.Count == 0 && !_meterOn))
             {
                 if (Visible) { Visible = false; _tip.HideTip(); _hoverSid = ""; _hoverText = ""; }
+                _meter.Paused = true;   // nobody can see it (e.g. a fullscreen game) - don't spend the cycles
                 return;
             }
 
@@ -354,6 +412,7 @@ sealed class WidgetForm : Form
                 UpdateRegion();
             }
             if (!Visible) Visible = true;
+            _meter.Paused = false;
             if (++_tick % 10 == 0) AssertTopmost();   // ~1s belt-and-suspenders; the foreground hook does the rest
             if (!_moved) UpdateHover(PointToClient(Cursor.Position));
 
@@ -390,12 +449,14 @@ sealed class WidgetForm : Form
         old?.Dispose();
     }
 
-    bool EffectiveAnchorRight()
+    bool EffectiveAnchorRight() => AnchorRightFor(Bounds);
+
+    bool AnchorRightFor(Rectangle r)
     {
         if (_anchor == "right") return true;
         if (_anchor == "left") return false;
-        var wa = Screen.FromRectangle(Bounds).WorkingArea;         // auto: which half are we on
-        return Location.X + Width / 2 >= wa.Left + wa.Width / 2;
+        var wa = Screen.FromRectangle(r).WorkingArea;              // auto: which half are we on
+        return r.X + r.Width / 2 >= wa.Left + wa.Width / 2;
     }
 
     void DockDefault()
@@ -403,7 +464,7 @@ sealed class WidgetForm : Form
         // Centered horizontally, just above the taskbar, on the monitor with the cursor.
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
         Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Bottom - Height - 8);
-        _home = Location;   // an explicit placement — this is now the spot to return to
+        SetHome(Location);  // an explicit placement — this is now the spot to return to
         ComputeRel();
     }
 
@@ -457,7 +518,21 @@ sealed class WidgetForm : Form
     // home belongs to. A temporary off-screen clamp (a monitor briefly gone, or a smaller RDP
     // screen) must never overwrite where you put it, or the widget gets stranded mid-screen when
     // you return to your real display.
-    void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) { _home = Location; ComputeRel(); } }
+    void MarkHome() { if (FullyOnScreen() && HomeFitsSomeScreen()) { SetHome(Location); ComputeRel(); } }
+
+    void SetHome(Point p) { _home = p; _homeW = Width; }
+
+    // _home is a top-left corner captured at width _homeW. If the strip is now a different width
+    // (it restarted with more/fewer tiles, the meter was toggled, or it resized while away on an
+    // RDP screen where home couldn't be updated), keep the ANCHORED edge where you put it - the
+    // same rule live growth follows - instead of the left edge, which used to drift a
+    // right-anchored strip sideways on every restart.
+    void RebaseHome()
+    {
+        if (_home.X < 0 || _homeW <= 0 || _homeW == Width) { if (_home.X >= 0 && _homeW <= 0) _homeW = Width; return; }
+        if (AnchorRightFor(new Rectangle(_home, new Size(_homeW, Height)))) _home.X += _homeW - Width;
+        _homeW = Width;
+    }
 
     // Capture _home as an edge-relative spec: which corner it hugs, and the logical (DPI-normalized)
     // gap to that corner. This lets the exact spot be reproduced on a different-size/DPI screen
@@ -524,6 +599,7 @@ sealed class WidgetForm : Form
             // visibility WITHOUT saving, so the moment your layout is back it snaps home.
             var want = ContentSize();
             if (Size != want) Size = want;
+            RebaseHome();   // home was captured at another width (e.g. tiles changed while on RDP)
             // On home's own screen, snap to the exact spot. On a smaller/foreign screen where home
             // no longer fits, reproduce the same corner + gap (left of the tray) instead of letting
             // EnsureOnScreen hard-clamp it against the edge.
@@ -628,6 +704,32 @@ sealed class WidgetForm : Form
         }
         catch { }
 
+        // A tile per LIVE session, not per .meta. The shim writes .meta on the first hook event
+        // it sees, so a session whose .meta is missing or late (hooks added after it started, its
+        // tile dismissed, a hook invocation that failed) had NO tile at all even though Claude
+        // lists it as live - which is how two Claudes in one folder could show up as one tile.
+        // The registry already decides when a tile dies; now it decides birth too. .meta stays
+        // the source of the auto-approval tally and of the status fallback.
+        var fresh = new List<KeyValuePair<string, RegInfo>>(reg);
+        fresh.Sort((a, b) => a.Value.StartedAt.CompareTo(b.Value.StartedAt));   // lay new tiles out in launch order
+        foreach (var kv in fresh)
+        {
+            var sid = kv.Key;
+            if (live.Contains(sid) || _dismissed.Contains(sid)) continue;
+            var s = _sessions.TryGetValue(sid, out var had) ? had : new Session();
+            if (kv.Value.Cwd.Length > 0) s.Cwd = kv.Value.Cwd;
+            var st = ReadShared(Path.Combine(SessionsDir, sid + ".state"));
+            s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
+            _sessions[sid] = s;
+            live.Add(sid);
+        }
+
+        // Forget a dismissal once that session is gone - or has a .meta again, meaning it acted
+        // since you dismissed it, which is exactly when the tile used to come back. Skipped when
+        // the registry is unreadable, so a blip can't resurrect every dismissed tile.
+        if (_dismissed.Count > 0 && regUsable)
+            _dismissed.RemoveWhere(sid => !reg.ContainsKey(sid) || live.Contains(sid));
+
         if (_moved && _hitKind == Hit.Tile) return;   // don't churn order mid reorder-drag
 
         bool changed = false;
@@ -644,17 +746,21 @@ sealed class WidgetForm : Form
         // Apply /name and live busy/idle status from the registry we already loaded.
         foreach (var kv in _sessions)
         {
-            if (reg.TryGetValue(kv.Key, out var info)) { kv.Value.Name = info.name; kv.Value.LiveStatus = info.status; }
+            if (reg.TryGetValue(kv.Key, out var info))
+            {
+                kv.Value.Name = info.Name; kv.Value.LiveStatus = info.Status; kv.Value.StartedAt = info.StartedAt;
+            }
             else { kv.Value.Name = ""; kv.Value.LiveStatus = ""; }
         }
     }
 
     // Read Claude Code's per-session registry (~/.claude/sessions/<pid>.json): maps our
-    // session id -> (/name title, live status). Undocumented/internal, so best-effort —
-    // any failure just leaves name/status blank and we fall back to folder + hook signal.
-    static Dictionary<string, (string name, string status)> LoadRegistry()
+    // session id -> what Claude knows about it. This is both our liveness signal and (since a
+    // live session may have no .meta yet) the list of tiles to show. Undocumented/internal, so
+    // best-effort - any failure just drops that entry and we fall back to folder + hook signal.
+    static Dictionary<string, RegInfo> LoadRegistry()
     {
-        var map = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
+        var map = new Dictionary<string, RegInfo>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var dir = Path.Combine(
@@ -673,7 +779,10 @@ sealed class WidgetForm : Form
                     if (string.IsNullOrEmpty(sid)) continue;
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
-                    map[sid] = (name, status);
+                    var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
+                    long started = r.TryGetProperty("startedAt", out var t)
+                                   && t.ValueKind == JsonValueKind.Number && t.TryGetInt64(out var ms) ? ms : 0;
+                    map[sid] = new RegInfo(name, status, cwd, started);
                 }
                 catch { }
             }
@@ -681,6 +790,9 @@ sealed class WidgetForm : Form
         catch { }
         return map;
     }
+
+    // What we keep from one registry entry.
+    readonly record struct RegInfo(string Name, string Status, string Cwd, long StartedAt);
 
     // Lowercase keys mirror the .meta JSON the shim writes.
     sealed class MetaDto
@@ -693,12 +805,19 @@ sealed class WidgetForm : Form
     // ---- geometry --------------------------------------------------------
 
     Rectangle GripRect() => new(Pad, Pad, Grip, Tile);
-    Rectangle TileRect(int i) => new(Pad + Grip + Gap + i * (Tile + Gap), Pad, Tile, Tile);
+    // The meter is exactly two tiles wide (gap included) and always first: right of the grip,
+    // left of every session tile. Session tiles start after it, so it is never a drop target.
+    const int MeterSlots = 2;
+    int MeterW => Tile * MeterSlots + Gap * (MeterSlots - 1);
+    int TilesX => Pad + Grip + Gap + (_meterOn ? MeterW + Gap : 0);
+    Rectangle MeterRect() => new(Pad + Grip + Gap, Pad, MeterW, Tile);
+    Rectangle TileRect(int i) => new(TilesX + i * (Tile + Gap), Pad, Tile, Tile);
 
     Hit HitTest(Point p, out int index)
     {
         index = -1;
         if (GripRect().Contains(p)) return Hit.Grip;
+        if (_meterOn && MeterRect().Contains(p)) return Hit.Meter;
         for (int i = 0; i < _order.Count; i++)
             if (TileRect(i).Contains(p)) { index = i; return Hit.Tile; }
         return Hit.None;
@@ -706,7 +825,7 @@ sealed class WidgetForm : Form
 
     int SlotFromX(int x) =>
         _order.Count == 0 ? -1   // Math.Clamp(_, 0, -1) would throw; no slots to target anyway
-            : Math.Clamp((int)Math.Round((x - (Pad + Grip + Gap)) / (double)(Tile + Gap)), 0, _order.Count - 1);
+            : Math.Clamp((int)Math.Round((x - TilesX) / (double)(Tile + Gap)), 0, _order.Count - 1);
 
     // ---- painting --------------------------------------------------------
 
@@ -724,6 +843,8 @@ sealed class WidgetForm : Form
             for (int cx = 0; cx < 2; cx++)
                 for (int cy = 0; cy < 3; cy++)
                     g.FillEllipse(dot, gr.X + Sc(3) + cx * Sc(6), gr.Y + Tile / 2 - Sc(11) + cy * Sc(8), Sc(4), Sc(4));
+
+        if (_meterOn) DrawMeter(g, MeterRect());
 
         bool lifting = _moved && _hitKind == Hit.Tile && _dragSid != null;
         int liftIdx = lifting ? _order.IndexOf(_dragSid!) : -1;
@@ -764,6 +885,49 @@ sealed class WidgetForm : Form
             g.FillPath(sb, shadow);
 
         g.DrawImage(img, new Rectangle(left - Grow, Pad - Lift - Grow, Tile + Grow * 2, Tile + Grow * 2));
+    }
+
+    // Bar colour by load, in the mascot tiles' own tints (assets/make_icons.py TINTS) plus a
+    // matching red: green under 25%, yellow 25-50%, red over 50%.
+    static readonly Color MeterLow = Color.FromArgb(43, 166, 82);     // = waiting-tile green
+    static readonly Color MeterMid = Color.FromArgb(232, 176, 28);    // = working-tile yellow
+    static readonly Color MeterHigh = Color.FromArgb(214, 64, 52);
+    static Color MeterColor(double v) => v < 25 ? MeterLow : v <= 50 ? MeterMid : MeterHigh;
+
+    // The system meter: four vertical bars filling from the bottom - CPU, Memory, Network, GPU,
+    // left to right - on a tile-shaped plate. No labels; the hover tooltip says which is which.
+    // Values come from the sampler's latest snapshot (empty tracks until the first one lands).
+    void DrawMeter(Graphics g, Rectangle r)
+    {
+        using (var plate = Rounded(r, Math.Max(1, Sc(4))))   // near-square, like the tiles
+        using (var fill = new SolidBrush(Color.FromArgb(46, 46, 53)))
+            g.FillPath(fill, plate);
+
+        var snap = _meter.Latest;
+        double[] vals = snap == null ? new double[4] : new[] { snap.Cpu, snap.Mem, snap.Net, snap.Gpu };
+
+        int pad = Sc(6), gapX = Sc(5);
+        int colW = Math.Max(1, (r.Width - pad * 2 - gapX * 3) / 4);
+        int left = r.X + (r.Width - (colW * 4 + gapX * 3)) / 2;   // centre the leftover pixel or two
+        int top = r.Y + pad, colH = Math.Max(1, r.Height - pad * 2);
+
+        using var trackBrush = new SolidBrush(Color.FromArgb(24, 24, 28));
+        for (int i = 0; i < vals.Length; i++)
+        {
+            var track = new Rectangle(left + i * (colW + gapX), top, colW, colH);
+            using var path = Rounded(track, Math.Max(1, Math.Min(Sc(3), colW / 2)));
+            g.FillPath(trackBrush, path);
+
+            double v = Math.Clamp(vals[i], 0, 100);
+            int h = (int)Math.Round(colH * v / 100);
+            if (v > 0) h = Math.Max(h, Sc(2));   // any activity at all stays visible (network idles near 0%)
+            if (h <= 0) continue;
+            var state = g.Save();
+            g.SetClip(path, CombineMode.Intersect);   // bar keeps the track's rounded ends at any height
+            using (var bar = new SolidBrush(MeterColor(v)))
+                g.FillRectangle(bar, track.X, track.Bottom - h, track.Width, h);
+            g.Restore(state);
+        }
     }
 
     Bitmap TileFor(Session s) =>
@@ -843,7 +1007,7 @@ sealed class WidgetForm : Form
             if (!_moved && _hitKind == Hit.Tile && _dragSid != null) ToggleSession(_dragSid);
             else if (_moved)
             {
-                if (_hitKind == Hit.Grip) { EnsureOnScreen(); _home = Location; ComputeRel(); }   // you moved it — new home
+                if (_hitKind == Hit.Grip) { EnsureOnScreen(); SetHome(Location); ComputeRel(); }   // you moved it — new home
                 SaveConfig();
             }
         }
@@ -854,26 +1018,32 @@ sealed class WidgetForm : Form
         base.OnMouseUp(e);
     }
 
+    const string MeterHoverKey = "meter:";   // hover key for the meter; can't collide with a session id
+
     void UpdateHover(Point p)
     {
         var kind = HitTest(p, out int idx);
-        var sid = kind == Hit.Tile && _sessions.ContainsKey(_order[idx]) ? _order[idx] : "";
-        var text = sid.Length > 0 ? TileTooltip(sid) : "";
-        if (sid == _hoverSid && text == _hoverText) return;   // refresh when sid OR its data changes
-        _hoverSid = sid;
+        string key = "", text = "";
+        var r = Rectangle.Empty;
+        if (kind == Hit.Tile && _sessions.ContainsKey(_order[idx])) { key = _order[idx]; text = TileTooltip(key); r = TileRect(idx); }
+        else if (kind == Hit.Meter) { key = MeterHoverKey; text = MeterTooltip(); r = MeterRect(); }
+        if (key == _hoverSid && text == _hoverText) return;   // refresh when target OR its data changes
+        _hoverSid = key;
         _hoverText = text;
         if (text.Length == 0) { _tip.HideTip(); return; }
-        var tr = TileRect(idx);
-        int anchorX = PointToScreen(new Point(tr.X + tr.Width / 2, tr.Y)).X;   // center of the hovered tile
+        int anchorX = PointToScreen(new Point(r.X + r.Width / 2, r.Y)).X;   // center of the hovered tile
         _tip.ShowTip(text, Bounds, anchorX);
     }
+
+    // Tick re-runs UpdateHover every 100 ms, so this live text refreshes as each sample lands.
+    string MeterTooltip() => _meter.Latest?.Describe() ?? "System meter\nsampling...";
 
     string TileTooltip(string sid)
     {
         var s = _sessions[sid];
         var enabled = s.Hooking ? "hooking" : "manual";
         var need = s.Working ? "working" : "waiting on you";
-        return $"{DisplayName(s)}\n{enabled} · {need}\n{s.Count} auto-approval{(s.Count == 1 ? "" : "s")}";
+        return $"{Label(sid)}\n{enabled} · {need}\n{s.Count} auto-approval{(s.Count == 1 ? "" : "s")}";
     }
 
     static string DisplayName(Session s) =>
@@ -896,6 +1066,16 @@ sealed class WidgetForm : Form
     void ToggleLock() { _locked = !_locked; RefreshMenuChecks(); SaveConfig(); Invalidate(); }
     void SetNewSide(string v) { _newSide = v; RefreshMenuChecks(); SaveConfig(); }
     void SetAnchor(string v) { _anchor = v; RefreshMenuChecks(); SaveConfig(); }
+
+    void ToggleMeter()
+    {
+        _meterOn = !_meterOn;
+        if (_meterOn) _meter.Start(); else _meter.Stop();   // off = no sampling at all
+        RefreshMenuChecks();
+        SaveConfig();
+        Tick();         // resize by two tiles, keeping the anchored edge (and show/hide if it's all there is)
+        Invalidate();   // every session tile shifted
+    }
 
     // ---- fullscreen guard ------------------------------------------------
 
@@ -987,9 +1167,12 @@ sealed class WidgetForm : Form
                     _locked = c.Locked;
                     _anchor = c.Anchor is "left" or "right" or "auto" ? c.Anchor : "auto";
                     _newSide = c.NewSide is "left" or "right" ? c.NewSide : "right";
+                    _meterOn = c.Meter;
                     foreach (var sid in c.Order ?? new List<string>())
                         if (!string.IsNullOrWhiteSpace(sid) && !_order.Contains(sid)) _order.Add(sid);
-                    if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); Location = _home; }
+                    foreach (var sid in c.Dismissed ?? new List<string>())
+                        if (!string.IsNullOrWhiteSpace(sid)) _dismissed.Add(sid);
+                    if (c.X >= 0 && c.Y >= 0) { _home = new Point(c.X, c.Y); _homeW = Math.Max(0, c.HomeW); Location = _home; }
                     _relRight = c.HomeRight; _relBottom = c.HomeBottom;
                     _relGapX = c.HomeGapX; _relGapY = c.HomeGapY;
                     _relValid = c.HomeGapX >= 0 && c.HomeGapY >= 0;
@@ -1010,8 +1193,8 @@ sealed class WidgetForm : Form
                 // Persist _home, never the live Location — the live one may be a temporary
                 // clamp to stay visible while a monitor is missing, which must not become the
                 // remembered spot.
-                X = _home.X, Y = _home.Y, Locked = _locked,
-                Anchor = _anchor, NewSide = _newSide, Order = new(_order),
+                X = _home.X, Y = _home.Y, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
+                Anchor = _anchor, NewSide = _newSide, Order = new(_order), Dismissed = new(_dismissed),
                 HomeRight = _relRight, HomeBottom = _relBottom,
                 HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,
             }));
@@ -1036,6 +1219,7 @@ sealed class WidgetForm : Form
             SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
             _poll?.Dispose();
+            _meter.Dispose();
             _menu?.Dispose();
             _tip?.Dispose();
             _workOn?.Dispose(); _workOff?.Dispose(); _waitOn?.Dispose(); _waitOff?.Dispose();

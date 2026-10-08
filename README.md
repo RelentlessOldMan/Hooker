@@ -19,7 +19,7 @@ with one mascot tile **per session**.
 - **Yellow** = that session is **working** (busy — sit tight).
 - **Salmon** mascot = **hooking** (its prompts auto-approve). **Grey** = **manual** (normal prompting).
 
-Each tile is labeled with the session's **`/name`** (falling back to its folder), and it goes yellow the instant Claude starts *thinking* — both read live from Claude's own session registry. Each session is independent: one can be on autopilot while another is hand-driven and a third sits waiting.
+Each tile is labeled with the session's **`/name`** (falling back to its folder; two unnamed sessions in the same folder are numbered `(1)`, `(2)` by launch order), and it goes yellow the instant Claude starts *thinking* — both read live from Claude's own session registry. Each session is independent: one can be on autopilot while another is hand-driven and a third sits waiting.
 
 ## The widget
 
@@ -31,9 +31,19 @@ A borderless, always-on-top strip. One tile per live session — here it is dock
 - **Drag a tile** — reorder it (works locked or not), to match your terminal layout.
 - **Drag the grip** (dots on the left) — move the whole widget (only when **unlocked**).
 - **Hover a tile** — a tip (placed above/below, never over the tiles) shows `name · hooking/manual · working/waiting · N auto-approvals`.
-- **Right-click** — menu: version, **Dismiss** (per tile), **Lock/Unlock position**, **New sessions appear** (right/left), **Grow direction** (auto / anchor-right / anchor-left), **Reset position**, **Exit**.
+- **Right-click** — menu: version, **Dismiss** (per tile), **Lock/Unlock position**, **System meter** (on/off), **New sessions appear** (right/left), **Grow direction** (auto / anchor-right / anchor-left), **Reset position**, **Save debug log**, **Exit**.
 
-It stays **in front of the taskbar**, **hides** while a fullscreen app owns the same monitor (games safe), and defaults to **centered just above the taskbar**. Position, lock, order, anchor, and new-session side persist to `widget.json`.
+### System meter
+
+The left-most "two tiles" (exactly two tiles + the gap wide) are a live meter: four vertical bars — **CPU, Memory, Network, GPU**, left to right — colored by load: **green** under 25%, **yellow** 25–50%, **red** over 50% (the same green/yellow as the session tiles). It's fixed in place (always first, never draggable), samples once a second off the UI thread, and pauses while the widget is hidden for a fullscreen app. Toggle it from the right-click menu.
+
+- **CPU** is *real work* — the inverse of System Idle — not Task Manager's "% Processor Utility", which counts time the cores are merely awake and can read 70–90% on an idle machine (High-performance power plan, hypervisor present).
+- **Network** is link utilization of the busiest adapter (throughput ÷ link speed), so everyday traffic on gigabit stays a sliver.
+- **GPU** is the busiest engine of the busiest GPU, as Task Manager computes it.
+
+**Hover** it for detail: CPU model, current/base speed, cores/logical processors, processes/threads/handles, uptime; memory in use/available/cached/committed; adapter name, send/receive, link speed; per-GPU name, dedicated memory, temperature and fan speed (where the driver reports them).
+
+It stays **in front of the taskbar**, **hides** while a fullscreen app owns the same monitor (games safe), and defaults to **centered just above the taskbar**. Position, lock, order, anchor, new-session side, and the meter toggle persist to `widget.json`.
 
 > **Start menu:** while the Windows 11 Start menu is *open*, it renders above all normal windows, so a widget sitting on/under it is hidden until Start closes — an OS limitation. Park it above the taskbar and off-center to always keep it visible.
 
@@ -41,9 +51,11 @@ It stays **in front of the taskbar**, **hides** while a fullscreen app owns the 
 
 A session that ends cleanly (`/exit`) removes its tile via `SessionEnd`. An abrupt close (killed terminal, crash) can't fire that hook — so the widget instead watches **Claude's own session registry** (files named by PID): the instant a session drops out of it (which Claude does even on an abrupt close), its tile is **evicted within ~1.5s**. Liveness is driven purely by that registry — a session that's *there* keeps its tile (even if it sits idle for days), and one that's *gone* loses it; there is no age-based timeout. If the registry is ever unavailable, tiles are left in place until it returns (self-healing: a live session's next hook event refreshes its tile) — and right-click → **Dismiss** clears one instantly.
 
+Tiles come from the registry too: every live session gets a tile even if its hook hasn't fired yet (e.g. it was started before Hooker was installed), and a **Dismiss**ed tile stays dismissed until that session does something again or ends.
+
 ### Multi-monitor & display changes
 
-**Wherever you park it, it stays there** — on any monitor. The widget remembers your chosen spot ("home") and returns to exactly it across display-configuration changes: a monitor added or removed, a **duplicate** toggled on/off, a resolution or DPI change. It's per-monitor DPI-aware and never lets Windows auto-resize it. The *only* time it touches its own position is when home momentarily doesn't fit any connected monitor (e.g. a duplicate dropped your resolution) — then it clamps just enough to stay visible, **without** overwriting home, so the instant your normal layout is back it snaps precisely home. Your spot only ever changes when *you* change it (drag the grip, or right-click → **Reset position**).
+**Wherever you park it, it stays there** — on any monitor. The widget remembers your chosen spot ("home") and returns to exactly it across display-configuration changes: a monitor added or removed, a **duplicate** toggled on/off, a resolution or DPI change. It's per-monitor DPI-aware and never lets Windows auto-resize it. The *only* time it touches its own position is when home momentarily doesn't fit any connected monitor (e.g. a duplicate dropped your resolution) — then it clamps just enough to stay visible, **without** overwriting home, so the instant your normal layout is back it snaps precisely home. Your spot only ever changes when *you* change it (drag the grip, or right-click → **Reset position**). It's anchored by the edge it grows from: a right-anchored strip keeps its **right** edge put even when it comes back a different width (sessions came or went while it was closed, or the meter was toggled).
 
 ## ⚠️ Security — read this
 
@@ -66,7 +78,7 @@ hooks  (hook.exe)         --writes--> ...\.claude\hooker\sessions\<sid>.meta    
 - `Stop`, `Notification` → waiting
 - `SessionEnd` → removes the session's files
 
-The widget also reads Claude's internal per-session registry (`~/.claude/sessions/*.json`) for the `/name` title and live busy status — **best-effort**: it's undocumented and may change between Claude versions, in which case tiles fall back to folder names + hook-based status (nothing breaks).
+The widget also reads Claude's internal per-session registry (`~/.claude/sessions/*.json`) for which sessions are live, their `/name` title and live busy status — **best-effort**: it's undocumented and may change between Claude versions, in which case tiles fall back to folder names + hook-based status (nothing breaks).
 
 The shim **fails open**: any error → prints nothing, exits 0 → Claude behaves normally. It never blocks Claude.
 
@@ -123,7 +135,7 @@ Hooker/
   assets/make_icons.py    -> tile-<work|wait>_<on|off>.png  (bg=status, body=hooking)
   docs/mockup.py          -> promo images
   shim/                   hook.exe         (.NET console, per-session state)
-  tray/                   HookerWidget.exe (.NET WinForms floating widget)
+  tray/                   HookerWidget.exe (.NET WinForms floating widget; SystemMeter.cs = the meter)
   dist/                   built exes + settings-hooks-snippet.json
   build.ps1  install-hook.ps1  uninstall-hook.ps1  "Install Hooker.cmd"
 ```
