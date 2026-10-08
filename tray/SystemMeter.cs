@@ -111,6 +111,7 @@ sealed class SystemMeter : IDisposable
     readonly object _timerLock = new();
     readonly object _sampleLock = new();
     System.Threading.Timer? _timer;
+    int _gen;   // bumped by every Start; each callback carries the generation of the timer that fired it
     volatile bool _disposed;
     volatile bool _needPrime;   // take a baseline instead of publishing (first sample, or after a pause)
     bool _inited;
@@ -129,7 +130,7 @@ sealed class SystemMeter : IDisposable
         {
             if (_disposed || _timer != null) return;
             _needPrime = true;
-            _timer = new System.Threading.Timer(Run, null, 0, Timeout.Infinite);
+            _timer = new System.Threading.Timer(Run, ++_gen, 0, Timeout.Infinite);
         }
     }
 
@@ -160,23 +161,28 @@ sealed class SystemMeter : IDisposable
     }
 
     // One-shot timer re-armed after each sample, so a slow sample can never overlap the next.
-    void Run(object? _)
+    void Run(object? state)
     {
-        lock (_timerLock) { if (_timer == null) return; }   // stopped while this callback was queued
+        // A callback queued by a timer that has since been stopped (and maybe replaced by a quick
+        // off/on) is stale: it must not eat the new timer's priming sample or re-arm it.
+        int gen = (int)state!;
+        bool Current() => _timer != null && gen == _gen;   // call under _timerLock
+        lock (_timerLock) { if (!Current()) return; }
 
         MeterSnapshot? snap = null;
         lock (_sampleLock)
         {
             if (_disposed) return;
+            lock (_timerLock) { if (!Current()) return; }
             if (Paused) _needPrime = true;   // on resume: fresh baseline, not one rate averaged over the pause
             else try { snap = Sample(); } catch { }
         }
 
         lock (_timerLock)
         {
-            if (_timer == null) return;      // stopped mid-sample: don't publish into a stopped meter
+            if (!Current()) return;          // stopped mid-sample: don't publish into a stopped meter
             if (snap != null) Volatile.Write(ref _latest, snap);
-            _timer.Change(PeriodMs, Timeout.Infinite);
+            _timer!.Change(PeriodMs, Timeout.Infinite);
         }
         if (snap != null) try { Sampled?.Invoke(); } catch { }
     }
@@ -194,6 +200,9 @@ sealed class SystemMeter : IDisposable
     // Engine LUIDs DXGI still doesn't list after a re-enumeration (e.g. an NPU): not a GPU we can
     // name, so stop re-enumerating on their account.
     readonly HashSet<ulong> _unnamed = new();
+    // Listed adapters that still report no engines after a re-enumeration: leave them be, rather
+    // than re-enumerating on their account forever.
+    readonly HashSet<ulong> _quiet = new();
     ulong Owner(ulong luid) => _alias.TryGetValue(luid, out var o) ? o : luid;
     int _gpuEnumAge;
 
@@ -305,15 +314,16 @@ sealed class SystemMeter : IDisposable
                 rc = PdhGetFormattedCounterArray(counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, ref size, out uint count, buf);
                 if (rc == PDH_MORE_DATA) continue;   // instances grew between the two calls; ask again
                 if (rc != 0) return list;
-                // PDH_FMT_COUNTERVALUE_ITEM_W: name pointer, then { CStatus, pad, double }.
-                int stride = IntPtr.Size + 16;
+                // PDH_FMT_COUNTERVALUE_ITEM_W: name pointer, then the 8-aligned { CStatus, pad, double } -
+                // so status at 8, value at 16, 24 bytes per item on 32- and 64-bit alike.
+                const int stride = 24, statusAt = 8, valueAt = 16;
                 for (int i = 0; i < count; i++)
                 {
                     var item = buf + i * stride;
-                    int status = Marshal.ReadInt32(item, IntPtr.Size);
+                    int status = Marshal.ReadInt32(item, statusAt);
                     if (status is not (0 or 1)) continue;
                     var name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(item)) ?? "";
-                    list.Add((name, BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, IntPtr.Size + 8))));
+                    list.Add((name, BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, valueAt))));
                 }
                 return list;
             }
@@ -351,17 +361,23 @@ sealed class SystemMeter : IDisposable
             util[owner] = Math.Max(util.GetValueOrDefault(owner), kv.Value);
         }
 
-        // A LUID we can't name means the adapter set changed (driver update/reset) - re-enumerate,
-        // throttled so a permanently unmatched adapter can't make us do it every second.
+        // The adapter set changed (driver update/reset, eGPU plugged or unplugged, GPU disabled) when
+        // a LUID we can't name shows up, or a listed one has stopped reporting engines - re-enumerate,
+        // throttled so a permanent oddity can't make us do it every second.
         bool unmatched = false;
         foreach (var luid in util.Keys)   // keys are owners already
             if (!_unnamed.Contains(luid) && !_adapters.Exists(a => a.Luid == luid)) unmatched = true;
+        if (util.Count > 0 && _adapters.Exists(a => !util.ContainsKey(a.Luid) && !_quiet.Contains(a.Luid)))
+            unmatched = true;
         if ((unmatched || _adapters.Count == 0) && ++_gpuEnumAge >= 30)
         {
             _gpuEnumAge = 0;
             EnumGpus();
             foreach (var luid in util.Keys)
                 if (!_alias.ContainsKey(luid) && !_adapters.Exists(a => a.Luid == luid)) _unnamed.Add(luid);
+            if (util.Count > 0)
+                foreach (var a in _adapters)
+                    if (!util.ContainsKey(a.Luid)) _quiet.Add(a.Luid);
         }
 
         var ded = SumByLuid(Values(_cGpuDed), Owner);
@@ -406,6 +422,8 @@ sealed class SystemMeter : IDisposable
     {
         _adapters.Clear();
         _alias.Clear();
+        _unnamed.Clear();   // re-derived by the caller against the fresh list
+        _quiet.Clear();
         var found = new List<(Adapter A, string Model, bool Pci)>();
         IDXGIFactory1? factory = null;
         try

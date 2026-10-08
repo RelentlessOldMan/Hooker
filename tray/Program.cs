@@ -38,6 +38,10 @@ static class Program
     {
         using var mutex = new Mutex(true, "Hooker.Widget.SingleInstance", out bool isNew);
         if (!isNew) return;
+        // First thing once we hold the mutex (the shim's "widget is running" signal): start every
+        // session manual. Any later and a tool call landing during start-up could be auto-approved
+        // by a stale "on" left behind by a crash.
+        WidgetForm.WipeStates();
         ApplicationConfiguration.Initialize();
         // A transient WinForms hiccup should never kill an always-on widget.
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -202,7 +206,7 @@ sealed class WidgetForm : Form
         // session off, but a crash, a Task Manager kill or a release restart skips that - so
         // start every session manual, whatever earlier runs left behind. (The shim also refuses
         // to auto-approve while no widget is running; this covers the restart.)
-        try { foreach (var f in Directory.GetFiles(SessionsDir, "*.state")) File.Delete(f); } catch { }
+        WipeStates();   // Main already did this first thing; again in case a file was locked then
 
         SyncSessions();
         InitialLayout();
@@ -448,7 +452,7 @@ sealed class WidgetForm : Form
 
     void ClampX()
     {
-        var b = Screen.FromPoint(Location).Bounds;
+        var b = Screen.FromRectangle(Bounds).Bounds;   // the monitor it's mostly on, as EnsureOnScreen picks
         int x = Math.Clamp(Location.X, b.Left, Math.Max(b.Left, b.Right - Width));
         if (x != Location.X) Location = new Point(x, Location.Y);
     }
@@ -682,8 +686,10 @@ sealed class WidgetForm : Form
         // SessionEnd. It also decides which tiles exist: every live session gets one, whether or
         // not its hook has written a .meta yet. .meta supplies the auto-approval tally and the
         // status fallback.
-        var reg = LoadRegistry();
-        bool regUsable = reg.Count > 0;   // empty => registry unavailable/undocumented-shape-changed; don't prune blind
+        // Unusable = no registry folder, or entries present but none readable (format change, or every
+        // file mid-write): don't prune blind. An empty-but-present folder is usable: no live sessions,
+        // so the last tile goes away too.
+        var reg = LoadRegistry(out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
         var metas = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -760,7 +766,7 @@ sealed class WidgetForm : Form
             try
             {
                 foreach (var f in Directory.GetFiles(SessionsDir, "*.state"))
-                    if (!seen.Contains(Path.GetFileNameWithoutExtension(f))) File.Delete(f);
+                    if (!seen.Contains(Path.GetFileNameWithoutExtension(f))) try { File.Delete(f); } catch { }
             }
             catch { }
         }
@@ -799,15 +805,17 @@ sealed class WidgetForm : Form
     // session id -> what Claude knows about it. This is both our liveness signal and (since a
     // live session may have no .meta yet) the list of tiles to show. Undocumented/internal, so
     // best-effort - any failure just drops that entry and we fall back to folder + hook signal.
-    static Dictionary<string, RegInfo> LoadRegistry()
+    static Dictionary<string, RegInfo> LoadRegistry(out bool usable)
     {
         var map = new Dictionary<string, RegInfo>(StringComparer.OrdinalIgnoreCase);
+        usable = false;
         try
         {
             var dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "sessions");
             if (!Directory.Exists(dir)) return map;
-            foreach (var f in Directory.GetFiles(dir, "*.json"))
+            var files = Directory.GetFiles(dir, "*.json");
+            foreach (var f in files)
             {
                 try
                 {
@@ -817,7 +825,9 @@ sealed class WidgetForm : Form
                     var r = doc.RootElement;
                     if (!r.TryGetProperty("sessionId", out var sidEl)) continue;
                     var sid = sidEl.GetString();
-                    if (string.IsNullOrEmpty(sid)) continue;
+                    // The id names our files: accept only what the shim's Sanitize() leaves unchanged, so
+                    // both agree on file names and nothing can point outside the sessions folder.
+                    if (string.IsNullOrEmpty(sid) || !SafeId(sid)) continue;
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
@@ -827,9 +837,25 @@ sealed class WidgetForm : Form
                 }
                 catch { }
             }
+            usable = files.Length == 0 || map.Count > 0;
         }
         catch { }
         return map;
+    }
+
+    static bool SafeId(string sid)
+    {
+        foreach (var ch in sid)
+            if (!(char.IsAsciiLetterOrDigit(ch) || ch == '-' || ch == '_')) return false;
+        return true;
+    }
+
+    // Turn every session's autopilot off. Per file, so one locked file can't spare the rest.
+    internal static void WipeStates()
+    {
+        string[] files;
+        try { files = Directory.GetFiles(SessionsDir, "*.state"); } catch { return; }
+        foreach (var f in files) try { File.Delete(f); } catch { }
     }
 
     // What we keep from one registry entry.
@@ -1089,9 +1115,13 @@ sealed class WidgetForm : Form
         return $"{Label(sid)}\n{enabled} · {need}\n{s.Count} auto-approval{(s.Count == 1 ? "" : "s")}";
     }
 
-    static string DisplayName(Session s) =>
-        !string.IsNullOrWhiteSpace(s.Name) ? s.Name
-        : (s.Cwd.Length == 0 ? "session" : Path.GetFileName(s.Cwd.TrimEnd('/', '\\')));
+    static string DisplayName(Session s)
+    {
+        if (!string.IsNullOrWhiteSpace(s.Name)) return s.Name;
+        if (s.Cwd.Length == 0) return "session";
+        var leaf = Path.GetFileName(s.Cwd.TrimEnd('/', '\\'));
+        return leaf.Length > 0 ? leaf : s.Cwd;   // a drive root (C:\) has no folder name
+    }
 
     void ToggleSession(string sid)
     {
@@ -1102,7 +1132,11 @@ sealed class WidgetForm : Form
             Directory.CreateDirectory(SessionsDir);
             WriteAtomic(Path.Combine(SessionsDir, sid + ".state"), s.Hooking ? "on" : "off");
         }
-        catch { }
+        catch
+        {
+            s.Hooking = !s.Hooking;   // didn't take: show what's really in effect, and say so
+            System.Media.SystemSounds.Hand.Play();
+        }
         Invalidate();
     }
 

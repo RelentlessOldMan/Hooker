@@ -12,7 +12,19 @@ $ErrorActionPreference = 'Stop'
 # Hooker's own entries: any command ending in dist/hook.exe, wherever the folder lives - so a
 # re-install from a moved or newer release folder replaces the old entry instead of leaving
 # both registered (both would run on every event).
-function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe$' }
+# The command is written quoted (see install-hook.ps1); older installs wrote it bare - match both.
+function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe"?$' }
+
+# An event's hook groups minus Hooker's own commands: a group holding only Hooker goes, but a
+# group where you'd also put hooks of your own keeps them.
+function Remove-HookerEntries($groups) {
+    foreach ($g in @($groups)) {
+        $all    = @($g.hooks)
+        $others = @($all | Where-Object { -not (Test-HookerCommand $_.command) })
+        if ($others.Count -eq $all.Count) { $g }
+        elseif ($others.Count -gt 0) { $g.hooks = $others; $g }
+    }
+}
 
 $settings = Join-Path $env:USERPROFILE '.claude\settings.json'
 $hookExe  = Join-Path $PSScriptRoot 'dist\hook.exe'
@@ -21,8 +33,10 @@ if (-not (Test-Path $hookExe)) { throw "hook.exe not found at $hookExe - build t
 
 # Claude Code runs hook commands through bash, which treats backslashes as escape
 # characters (C:\Playground -> C:Playground). Use forward slashes, which bash
-# passes through untouched and Windows still accepts when launching the exe.
+# passes through untouched and Windows still accepts when launching the exe - and quote
+# the path, or a space ("C:/Users/John Smith/...") or parentheses ("Hooker (1)") break it.
 $hookExe = $hookExe -replace '\\', '/'
+if ($hookExe -match '["$`\\]') { throw "Hooker's folder path contains a character a hook command can't quote safely: $hookExe" }
 
 $backup = $null
 if (Test-Path $settings) {
@@ -40,7 +54,7 @@ if (Test-Path $settings) {
 
 $tmp = "$settings.hooker-tmp"
 try {
-    $cmd       = [pscustomobject]@{ type = 'command'; command = $hookExe }
+    $cmd       = [pscustomobject]@{ type = 'command'; command = '"' + $hookExe + '"' }
     $withMatch = [pscustomobject]@{ matcher = '*'; hooks = @($cmd) }
     $noMatch   = [pscustomobject]@{ hooks = @($cmd) }
 
@@ -60,9 +74,7 @@ try {
         $ourGrp = $events[$e]
         if ($json.hooks.PSObject.Properties.Name -contains $e) {
             # Keep hooks you already had for this event; drop only a prior Hooker entry.
-            $kept = @($json.hooks.$e | Where-Object {
-                -not ($_.hooks | Where-Object { Test-HookerCommand $_.command })
-            })
+            $kept = @(Remove-HookerEntries $json.hooks.$e)
             $json.hooks.$e = @($kept + $ourGrp)
         } else {
             $json.hooks | Add-Member -NotePropertyName $e -NotePropertyValue @($ourGrp)

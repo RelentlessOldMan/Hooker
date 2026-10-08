@@ -9,7 +9,19 @@ $ErrorActionPreference = 'Stop'
 # Hooker's own entries: any command ending in dist/hook.exe, wherever the folder lives - so a
 # re-install from a moved or newer release folder replaces the old entry instead of leaving
 # both registered (both would run on every event).
-function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe$' }
+# The command is written quoted (see install-hook.ps1); older installs wrote it bare - match both.
+function Test-HookerCommand([string]$c) { return $c -match '[\\/]dist[\\/]hook\.exe"?$' }
+
+# An event's hook groups minus Hooker's own commands: a group holding only Hooker goes, but a
+# group where you'd also put hooks of your own keeps them.
+function Remove-HookerEntries($groups) {
+    foreach ($g in @($groups)) {
+        $all    = @($g.hooks)
+        $others = @($all | Where-Object { -not (Test-HookerCommand $_.command) })
+        if ($others.Count -eq $all.Count) { $g }
+        elseif ($others.Count -gt 0) { $g.hooks = $others; $g }
+    }
+}
 
 # Turn every session's autopilot off: Hooker's hooks are going away, and a leftover "on" .state
 # must not quietly re-arm if Hooker is ever installed again.
@@ -29,10 +41,7 @@ try {
     if ($json.PSObject.Properties.Name -contains 'hooks') {
         foreach ($e in @('PreToolUse','UserPromptSubmit','Notification','Stop','SessionStart','SessionEnd')) {
             if ($json.hooks.PSObject.Properties.Name -notcontains $e) { continue }
-            # Keep every group except Hooker's (identified by our hook.exe command).
-            $kept = @($json.hooks.$e | Where-Object {
-                -not ($_.hooks | Where-Object { Test-HookerCommand $_.command })
-            })
+            $kept = @(Remove-HookerEntries $json.hooks.$e)
             if ($kept.Count -gt 0) { $json.hooks.$e = $kept }
             else { $json.hooks.PSObject.Properties.Remove($e) }
         }

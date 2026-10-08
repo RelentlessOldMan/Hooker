@@ -15,8 +15,10 @@ Set-Location $PSScriptRoot
 #    misconfigured environment fails fast instead of half-way through a release.
 $dirty = git status --porcelain
 if ($dirty) { throw "Working tree not clean - commit or stash your changes first, then re-run." }
-gh auth status *> $null
-if ($LASTEXITCODE -ne 0) { throw "gh is not authenticated - run 'gh auth login' first." }
+# try/catch: under 'Stop', PS 5.1 turns gh's stderr into a terminating error before the check runs.
+$ghOk = $false
+try { gh auth status *> $null; $ghOk = ($LASTEXITCODE -eq 0) } catch { }
+if (-not $ghOk) { throw "gh is not authenticated - run 'gh auth login' first." }
 $branch = (git rev-parse --abbrev-ref HEAD | Out-String).Trim()
 if ($branch -ne 'main') { throw "Releases are cut from main; you're on '$branch'." }
 
@@ -55,9 +57,9 @@ try {
     Remove-Item $zip -ErrorAction SilentlyContinue
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
 
-    # Checksums over every shipped artifact so downloaders can verify what they got.
+    # Checksum of what's actually attached (the zip), so `sha256sum -c` next to the download passes.
     Remove-Item $sums -ErrorAction SilentlyContinue
-    Get-FileHash $zip, 'dist\hook.exe', 'dist\HookerWidget.exe' -Algorithm SHA256 |
+    Get-FileHash $zip -Algorithm SHA256 |
         ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
         Set-Content $sums -Encoding ascii
 }

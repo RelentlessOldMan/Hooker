@@ -29,7 +29,8 @@ try {
 
     # Publish one project to a temp dir, then copy its exe into dist\ (retrying past a
     # transient lock from the running app or a firing hook). Publishing outside dist\
-    # means a lock can never corrupt the live exe -- the swap is all-or-nothing.
+    # means a failed build never touches the live exe. The copy itself isn't atomic: a hook
+    # firing mid-copy just fails that once (no auto-approve), and a re-run fixes a cut-off copy.
     # No -p:Version here: Directory.Build.props stamps the version from VERSION.
     function Publish-One($proj, $exe) {
         $tmp = Join-Path $env:TEMP ('hooker-build-' + [IO.Path]::GetFileNameWithoutExtension($proj))

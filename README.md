@@ -123,11 +123,11 @@ This is a personal tool, published as-is — **issues and pull requests aren't a
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall-hook.ps1
 ```
-Removes only Hooker's hooks (yours are preserved). Without them, Claude behaves exactly as stock.
+Removes only Hooker's hooks (yours are preserved) and turns autopilot off for every session. Without them, Claude behaves exactly as stock.
 
 ## Troubleshooting
 
-- **Nothing auto-approves / hook logs `command not found`.** Claude runs hooks through **bash**, which eats backslashes in a Windows path. The command must use **forward slashes** (`C:/…/hook.exe`); the installer does this — if you hand-edited `settings.json`, fix the slashes and restart Claude.
+- **Nothing auto-approves / hook logs `command not found`.** Claude runs hooks through **bash**, which eats backslashes in a Windows path. The command must use **forward slashes** and be **quoted** (`"C:/…/hook.exe"`, so a space or parentheses in the path don't split it); the installer does both — if you hand-edited `settings.json`, fix it and restart Claude. Installs from v1.0.24 or earlier wrote the path unquoted: re-run the installer if Hooker's folder path has a space or parentheses.
 - **Lost the widget?** Right-click any tile → **Reset position** (or it re-docks above the taskbar next launch).
 
 ## Caveat
@@ -145,6 +145,7 @@ Hooker/
   tray/                   HookerWidget.exe (.NET WinForms floating widget; SystemMeter.cs = the meter)
   dist/                   built exes
   build.ps1  install-hook.ps1  uninstall-hook.ps1  "Install Hooker.cmd"
+  release.ps1             bump VERSION, build, tag and publish a GitHub release
 ```
 
 ## License
