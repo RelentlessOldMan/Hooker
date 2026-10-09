@@ -11,6 +11,11 @@
 // .state and reads Claude's session registry (which sessions exist, /name, live busy)
 // plus each session's hook-written .meta (auto-approval tally) to render.
 //
+// A tile is one running session: "<sid>@<pid>", the session id plus its Claude process. Two
+// windows that resume the same conversation share a session id but are two sessions, so they
+// get two tiles, each with its own autopilot. (Just "<sid>" when there's no registry to say
+// which process.) Remember autopilot is per conversation, by session id.
+//
 // System meter (toggle in the right-click menu): the left-most "two tiles" are live vertical
 // bars (no labels) of Task Manager's Performance numbers - CPU, Memory, Network, GPU - with detail
 // (speeds, cores, memory, GPU temp...) on hover. It's fixed in place: always first, never
@@ -149,16 +154,17 @@ sealed class WidgetForm : Form
     readonly Dictionary<string, Session> _sessions = new();
     readonly HashSet<string> _seenInReg = new(StringComparer.OrdinalIgnoreCase);  // sids Claude has registered this run
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
-    readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // sids you dismissed; suppressed until they act again or die
+    readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // tiles you dismissed; suppressed until they act again or die
     bool _configDirty;                                                            // sync changed something persisted: save once
     readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // sids whose switch was last seen "on"
-    readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current sid
+    readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current tile
     readonly Dictionary<long, (string Name, long Created)> _pidSeen = new();       // what each registered pid was when first seen
-    readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new sid <- same process swapped ids
+    readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new tile <- same process swapped ids
+    readonly Dictionary<string, long> _tileSince = new(StringComparer.OrdinalIgnoreCase);   // when each tile appeared (Remember restores only then)
     int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
     bool _remember;                             // "Remember autopilot" (opt-in)
-    readonly Dictionary<string, long> _remembered = new(StringComparer.OrdinalIgnoreCase);   // sids to switch back on
+    readonly Dictionary<string, long> _remembered = new(StringComparer.OrdinalIgnoreCase);   // session ids (not tiles) to switch back on
     const long RememberDays = 90;               // forget a session not seen on autopilot for this long
     readonly SystemMeter _meter = new();
     bool _locked;
@@ -365,7 +371,7 @@ sealed class WidgetForm : Form
         _dismissed.Add(sid);   // the session is still live, so without this the tile returns next tick
         DeleteSessionFiles(sid);
         _lastOn.Remove(sid);
-        _remembered.Remove(sid);   // hiding a tile ends its autopilot for good - it comes back manual
+        ForgetUnlessOn(sid);       // hiding a tile ends its autopilot for good - it comes back manual
         _regMiss.Remove(sid);
         _order.Remove(sid);
         _sessions.Remove(sid);
@@ -714,6 +720,17 @@ sealed class WidgetForm : Form
         var reg = LoadRegistry(_pidSeen, out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
+        // Each listed session id's tiles. A tile named by the bare id is one the hook couldn't
+        // place in a process; once the registry lists that session it's either adopted (an
+        // older hook's, or written in the instant before Claude listed itself) or left unshown.
+        var bySid = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in reg)
+        {
+            if (!bySid.TryGetValue(kv.Value.Sid, out var tiles)) bySid[kv.Value.Sid] = tiles = new();
+            tiles.Add(kv.Key);
+        }
+        AdoptBareIds(bySid);
+
         // /clear (and an in-place /resume) gives the SAME Claude process a new session id, and the
         // old id's SessionEnd deletes its switch. Spot it by process, so the tile keeps its slot.
         // Only a process hosting exactly ONE session can be tracked this way: an IDE extension or
@@ -779,12 +796,17 @@ sealed class WidgetForm : Form
                     _regMiss.Remove(sid);
                     _dismissed.Remove(sid);
                     _lastOn.Remove(sid);
+                    _tileSince.Remove(sid);
                     DeleteSessionFiles(sid);
                     continue;
                 }
                 _regMiss[sid] = n;   // keep rendering the tile until the miss budget is spent
             }
             else _regMiss.Remove(sid);
+
+            // A bare-id .meta for a session the registry places in a process (shared by two
+            // windows, so it couldn't be adopted): not a tile of its own. Pruned once old.
+            if (!sid.Contains('@') && bySid.ContainsKey(sid)) continue;
 
             if (_dismissed.Contains(sid))
             {
@@ -800,6 +822,7 @@ sealed class WidgetForm : Form
                 && reg.TryGetValue(sid, out var pre) && pre.Status.Length == 0) continue;
 
             var s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
+            if (!_tileSince.ContainsKey(sid)) _tileSince[sid] = NowMs();
             string start = "";   // how this id's SessionStart came about (startup|resume|clear|compact)
             if (metaPath != null)
             {
@@ -825,7 +848,7 @@ sealed class WidgetForm : Form
                     try
                     {
                         WriteAtomic(statePath, "on"); st = "on";
-                        if (_remember) { _remembered[sid] = NowMs(); _configDirty = true; }
+                        if (_remember) { _remembered[SidOf(sid)] = NowMs(); _configDirty = true; }
                     }
                     catch { }
                 }
@@ -833,9 +856,12 @@ sealed class WidgetForm : Form
             }
             // No switch at all = this run hasn't decided: a widget start wiped it, or a resume did.
             // A remembered session gets its autopilot back. (An explicit "off" is never overridden.)
-            if (st == null && _remember && _remembered.ContainsKey(sid))
+            // Only while the tile is new (its own SessionStart may still wipe the switch): a second
+            // window on the same conversation that you've left manual must not follow the first.
+            if (st == null && _remember && _remembered.ContainsKey(SidOf(sid))
+                && NowMs() - _tileSince[sid] < RestoreWindowMs)
             {
-                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[sid] = NowMs(); _configDirty = true; } catch { }
+                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[SidOf(sid)] = NowMs(); _configDirty = true; } catch { }
             }
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
             // Track the switch only while it exists: SessionEnd deletes it just before a swap shows.
@@ -861,7 +887,7 @@ sealed class WidgetForm : Form
 
         bool changed = false;
         for (int i = _order.Count - 1; i >= 0; i--)
-            if (!live.Contains(_order[i])) { _sessions.Remove(_order[i]); _order.RemoveAt(i); changed = true; }
+            if (!live.Contains(_order[i])) { _sessions.Remove(_order[i]); _tileSince.Remove(_order[i]); _order.RemoveAt(i); changed = true; }
         foreach (var sid in live)
             if (!_order.Contains(sid))
             {
@@ -906,6 +932,7 @@ sealed class WidgetForm : Form
             _configDirty = true;
         }
         _sessions.Remove(old);
+        _tileSince.Remove(old);
         _regMiss.Remove(old);
         if (_dismissed.Remove(old)) _configDirty = true;
         DeleteSessionFiles(old);   // it has ended (its SessionEnd does the same); no lingering tile
@@ -953,7 +980,8 @@ sealed class WidgetForm : Form
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
                     long started = r.TryGetProperty("startedAt", out var t)
                                    && t.ValueKind == JsonValueKind.Number && t.TryGetInt64(out var ms) ? ms : 0;
-                    map[sid] = new RegInfo(name, status, cwd, started, pid, procStart);
+                    // Keyed by tile: the same conversation open in two windows is two sessions.
+                    map[pid > 0 ? sid + "@" + pid : sid] = new RegInfo(sid, name, status, cwd, started, pid, procStart);
                 }
                 catch { }
             }
@@ -1005,6 +1033,65 @@ sealed class WidgetForm : Form
         return true;
     }
 
+    // A tile id: a safe session id, optionally "@<pid>". Names files, so nothing else gets in.
+    static bool SafeTileId(string id)
+    {
+        int at = id.IndexOf('@');
+        if (at < 0) return id.Length > 0 && SafeId(id);
+        if (at == 0 || at == id.Length - 1 || !SafeId(id[..at])) return false;
+        foreach (var ch in id[(at + 1)..]) if (!char.IsAsciiDigit(ch)) return false;
+        return true;
+    }
+
+    static string SidOf(string tile) { int at = tile.IndexOf('@'); return at < 0 ? tile : tile[..at]; }
+
+    const long RestoreWindowMs = 15_000;   // how long a new tile may still get its remembered autopilot
+
+    // Bare session ids (from before tiles were per process, or written by the hook in the instant
+    // before Claude listed itself) become the session's tile when it's in exactly one process:
+    // its place in the strip, a dismissal, and its .meta (tally) carry over. A session in two
+    // processes can't be told apart, so its bare files are left to age out.
+    void AdoptBareIds(Dictionary<string, List<string>> bySid)
+    {
+        for (int i = 0; i < _order.Count; i++)
+        {
+            var id = _order[i];
+            if (id.Contains('@') || !bySid.TryGetValue(id, out var tiles) || tiles.Count != 1 || _order.Contains(tiles[0])) continue;
+            _order[i] = tiles[0];
+            if (_sessions.Remove(id, out var s)) _sessions[tiles[0]] = s;
+            if (_tileSince.Remove(id, out var since)) _tileSince[tiles[0]] = since;
+            _configDirty = true;
+        }
+        foreach (var id in new List<string>(_dismissed))
+            if (!id.Contains('@') && bySid.TryGetValue(id, out var tiles))
+            {
+                _dismissed.Remove(id);
+                foreach (var t in tiles) _dismissed.Add(t);
+                _configDirty = true;
+            }
+        try
+        {
+            foreach (var f in Directory.GetFiles(SessionsDir, "*.meta"))
+            {
+                var id = Path.GetFileNameWithoutExtension(f);
+                if (id.Contains('@') || !bySid.TryGetValue(id, out var tiles) || tiles.Count != 1) continue;
+                var to = Path.Combine(SessionsDir, tiles[0] + ".meta");
+                if (!File.Exists(to)) try { File.Move(f, to); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    // Stop remembering a conversation's autopilot - unless another of its windows is still on it.
+    void ForgetUnlessOn(string tile)
+    {
+        var sid = SidOf(tile);
+        foreach (var kv in _sessions)
+            if (kv.Value.Hooking && !kv.Key.Equals(tile, StringComparison.OrdinalIgnoreCase)
+                && SidOf(kv.Key).Equals(sid, StringComparison.OrdinalIgnoreCase)) return;
+        _remembered.Remove(sid);
+    }
+
     // Turn every session's autopilot off. Per file, so one locked file can't spare the rest.
     internal static void WipeStates()
     {
@@ -1014,7 +1101,7 @@ sealed class WidgetForm : Form
     }
 
     // What we keep from one registry entry.
-    readonly record struct RegInfo(string Name, string Status, string Cwd, long StartedAt, long Pid, long ProcStart);
+    readonly record struct RegInfo(string Sid, string Name, string Status, string Cwd, long StartedAt, long Pid, long ProcStart);
 
     // Lowercase keys mirror the .meta JSON the shim writes.
     sealed class MetaDto
@@ -1314,7 +1401,7 @@ sealed class WidgetForm : Form
         }
         if (_remember)
         {
-            if (s.Hooking) _remembered[sid] = NowMs(); else _remembered.Remove(sid);
+            if (s.Hooking) _remembered[SidOf(sid)] = NowMs(); else ForgetUnlessOn(sid);
             SaveConfig();
         }
         Invalidate();
@@ -1328,7 +1415,7 @@ sealed class WidgetForm : Form
         _remembered.Clear();
         if (_remember)
             foreach (var kv in _sessions)
-                if (kv.Value.Hooking) _remembered[kv.Key] = NowMs();
+                if (kv.Value.Hooking) _remembered[SidOf(kv.Key)] = NowMs();
         RefreshMenuChecks();
         SaveConfig();
     }
@@ -1443,9 +1530,9 @@ sealed class WidgetForm : Form
                     _meterOn = c.Meter;
                     // Ids name files in the sessions folder: only ones that can't point anywhere else.
                     foreach (var sid in c.Order ?? new List<string>())
-                        if (!string.IsNullOrEmpty(sid) && SafeId(sid) && !_order.Contains(sid)) _order.Add(sid);
+                        if (!string.IsNullOrEmpty(sid) && SafeTileId(sid) && !_order.Contains(sid)) _order.Add(sid);
                     foreach (var sid in c.Dismissed ?? new List<string>())
-                        if (!string.IsNullOrEmpty(sid) && SafeId(sid)) _dismissed.Add(sid);
+                        if (!string.IsNullOrEmpty(sid) && SafeTileId(sid)) _dismissed.Add(sid);
                     _remember = c.RememberAutopilot;
                     if (_remember)
                     {

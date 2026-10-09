@@ -8,18 +8,25 @@
 //   2. Per-session status: translate lifecycle events into each session's .meta file
 //      (status working/waiting, cwd, auto-approval count) that the widget renders.
 //
-// State lives under %USERPROFILE%\.claude\hooker\sessions\:
-//   <sid>.meta   {"status","cwd","count"}   (this shim writes; widget reads)
-//   <sid>.state  "on"/"off"                 (widget writes; this shim reads)
+// State lives under %USERPROFILE%\.claude\hooker\sessions\, one pair per tile:
+//   <tile>.meta   {"status","cwd","count"}   (this shim writes; widget reads)
+//   <tile>.state  "on"/"off"                 (widget writes; this shim reads)
+// A tile is one running Claude session: <sid>@<pid of its Claude process>. Two windows that
+// resume the same conversation share a session id, but each is its own session with its own
+// tile. Just <sid> when the Claude process can't be found (the registry is missing).
 //
 // Design rule: NEVER break Claude. Any error => print nothing, exit 0.
 
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
 var sessionsDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
     ".claude", "hooker", "sessions");
+var registryDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+    ".claude", "sessions");
 
 static string AllowJson() => JsonSerializer.Serialize(new
 {
@@ -57,10 +64,11 @@ try
     catch { /* no/invalid payload */ }
 
     if (sid.Length == 0) return 0; // nothing session-scoped to do
-    sid = Sanitize(sid);
+    long owner = Owner.Find(registryDir);
+    var tile = owner > 0 ? Sanitize(sid) + "@" + owner : Sanitize(sid);
 
-    var metaPath = Path.Combine(sessionsDir, sid + ".meta");
-    var statePath = Path.Combine(sessionsDir, sid + ".state");
+    var metaPath = Path.Combine(sessionsDir, tile + ".meta");
+    var statePath = Path.Combine(sessionsDir, tile + ".state");
 
     // Read allowing the widget (or another shim) to hold the file open — a plain File.ReadAllText
     // denies writers, so a concurrent rename/write would throw and we'd lose the read.
@@ -113,7 +121,7 @@ try
         bool held = false;
         try
         {
-            mx = new Mutex(false, "Hooker.Meta." + sid);
+            mx = new Mutex(false, "Hooker.Meta." + tile);
             try { held = mx.WaitOne(500); } catch (AbandonedMutexException) { held = true; }
         }
         catch { }
@@ -202,6 +210,64 @@ catch
 }
 
 return 0;
+
+// Which Claude process fired this hook. Claude lists each running session in its registry as
+// <pid>.json, and runs hooks as its own descendants (through a shell), so the nearest ancestor
+// with a registry entry is ours. That holds however Claude is installed - nothing here looks
+// at names or paths. 0 = not found (no registry, or this process already delisted - its
+// SessionEnd): never guess by session id, which another window of the same conversation shares
+// and whose files it would then wipe.
+static class Owner
+{
+    public static long Find(string registryDir)
+    {
+        try
+        {
+            if (!Directory.Exists(registryDir)) return 0;
+            var parents = Parents();
+            long pid = Environment.ProcessId;
+            for (int depth = 0; depth < 16 && parents.TryGetValue(pid, out var parent) && parent > 0; depth++)
+            {
+                pid = parent;
+                if (File.Exists(Path.Combine(registryDir, pid + ".json"))) return pid;
+            }
+            return 0;
+        }
+        catch { return 0; }
+    }
+
+    // pid -> parent pid for every process, from one snapshot.
+    static Dictionary<long, long> Parents()
+    {
+        var map = new Dictionary<long, long>();
+        var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == new IntPtr(-1)) return map;
+        try
+        {
+            var e = new PROCESSENTRY32W { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32W>() };
+            for (bool ok = Process32FirstW(snap, ref e); ok; ok = Process32NextW(snap, ref e))
+                map[e.th32ProcessID] = e.th32ParentProcessID;
+        }
+        finally { CloseHandle(snap); }
+        return map;
+    }
+
+    const uint TH32CS_SNAPPROCESS = 0x2;
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct PROCESSENTRY32W
+    {
+        public uint dwSize, cntUsage, th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID, cntThreads, th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snap, ref PROCESSENTRY32W e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr snap, ref PROCESSENTRY32W e);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+}
 
 // Lowercase property names mirror the on-disk .meta JSON keys the widget reads.
 sealed class Meta
