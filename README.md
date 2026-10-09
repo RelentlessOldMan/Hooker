@@ -113,6 +113,8 @@ powershell -ExecutionPolicy Bypass -File .\install-hook.ps1   # register hooks (
 ```
 Restart Claude and run `dist\HookerWidget.exe`.
 
+**Tests:** `powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1` replays every session/tile sequence that has broken before (two windows on one conversation, `/clear`, resume, Remember autopilot, killed or nested Claudes, …) against test builds of both exes, using stand-in Claude processes and a hidden widget in an isolated folder. Your installed Hooker isn't touched. Add `-SelfCheck` to put each past bug back, one at a time, and confirm a test catches it.
+
 > **Moved or re-cloned the folder?** The hook command is an absolute path in `settings.json`, so re-run the installer after moving `hook.exe` (it replaces the old entry rather than adding a second one).
 
 ## Contributing
@@ -144,6 +146,7 @@ Hooker/
   docs/mockup.py          -> promo images
   shim/                   hook.exe         (.NET console, per-session state)
   tray/                   HookerWidget.exe (.NET WinForms floating widget; SystemMeter.cs = the meter)
+  tests/                  run-tests.ps1 + Harness/ (scenario tests; not shipped)
   dist/                   built exes
   build.ps1  install-hook.ps1  uninstall-hook.ps1  "Install Hooker.cmd"
   release.ps1             bump VERSION, build, tag and publish a GitHub release
