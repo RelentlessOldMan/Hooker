@@ -211,14 +211,16 @@ catch
 
 return 0;
 
-// Which Claude process fired this hook. Claude lists each running session in its registry as
-// <pid>.json, and runs hooks as its own descendants (through a shell), so the nearest ancestor
-// whose entry names THIS session is ours. That holds however Claude is installed - nothing here
-// looks at names or paths. An ancestor listed under another session is skipped: an outer Claude
-// that started this one (a nested Claude never lists itself), or a dead Claude's leftover entry
-// whose pid Windows gave to the shell running this hook. 0 = not found (no registry, or this
-// process already delisted - its SessionEnd): never guess by session id alone, which another
-// window of the same conversation shares and whose files it would then wipe.
+// Which Claude process fired this hook. Claude lists each running session in its registry (one
+// JSON file per session, giving its pid and session id) and runs hooks as its own descendants
+// (through a shell), so the nearest ancestor listed with THIS session is ours. The pid comes from
+// the entry, as the widget takes it, so both name the tile alike - even for a process hosting
+// several sessions. That holds however Claude is installed - nothing here looks at names or
+// paths. An ancestor listed only under other sessions is skipped: an outer Claude that started
+// this one (a nested Claude never lists itself), or a dead Claude's leftover entry whose pid
+// Windows gave to the shell running this hook. 0 = not found (no registry, or this process
+// already delisted - its SessionEnd): never guess by session id alone, which another window of
+// the same conversation shares and whose files it would then wipe.
 static class Owner
 {
     public static long Find(string registryDir, string sid)
@@ -226,28 +228,45 @@ static class Owner
         try
         {
             if (!Directory.Exists(registryDir)) return 0;
+            var pids = new HashSet<long>();
+            foreach (var f in Directory.GetFiles(registryDir, "*.json"))
+                if (Read(f) is (string s, long p) && s == sid) pids.Add(p);
+            if (pids.Count == 0) return 0;
             var parents = Parents();
             long pid = Environment.ProcessId;
             for (int depth = 0; depth < 16 && parents.TryGetValue(pid, out var parent) && parent > 0; depth++)
             {
                 pid = parent;
-                if (ListedAs(Path.Combine(registryDir, pid + ".json")) == sid) return pid;
+                if (pids.Contains(pid)) return pid;
             }
             return 0;
         }
         catch { return 0; }
     }
 
-    // The session id a registry entry names, or null (no entry, or unreadable mid-write).
-    static string? ListedAs(string path)
+    // An entry's session id and pid, or null. Claude rewrites its entry on every status change, so
+    // a read can land mid-write: retry briefly before giving up (a miss only costs a prompt).
+    static (string, long)? Read(string path)
     {
-        try
+        for (int attempt = 0; ; attempt++)
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var doc = JsonDocument.Parse(fs);
-            return doc.RootElement.TryGetProperty("sessionId", out var s) ? s.GetString() : null;
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var doc = JsonDocument.Parse(fs);
+                var r = doc.RootElement;
+                if (r.TryGetProperty("sessionId", out var s) && s.GetString() is string sid
+                    && r.TryGetProperty("pid", out var p) && p.TryGetInt64(out var pid) && pid > 0)
+                    return (sid, pid);
+                return null;
+            }
+            catch (FileNotFoundException) { return null; }
+            catch
+            {
+                if (attempt >= 2) return null;
+                Thread.Sleep(15);
+            }
         }
-        catch { return null; }
     }
 
     // pid -> parent pid for every process, from one snapshot.

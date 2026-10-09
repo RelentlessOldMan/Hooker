@@ -102,6 +102,7 @@ sealed class WidgetConfig
     // long-gone sessions age out. Off by default: without it every start/resume is manual.
     public bool RememberAutopilot { get; set; }
     public Dictionary<string, long> Autopilot { get; set; } = new();
+    public List<string> OnTiles { get; set; } = new();
 
     // Strip width when X/Y was captured, in logical (DPI-independent) px; 0 = legacy/unknown.
     // X/Y is a top-left corner, so if the strip comes back a different width (sessions came/went,
@@ -156,8 +157,11 @@ sealed class WidgetForm : Form
     readonly Dictionary<string, int> _regMiss = new();                            // consecutive ticks a seen sid is registry-absent
     readonly HashSet<string> _dismissed = new(StringComparer.OrdinalIgnoreCase);  // tiles you dismissed; suppressed until they act again or die
     bool _configDirty;                                                            // sync changed something persisted: save once
-    readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // sids whose switch was last seen "on"
+    readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // tiles whose switch was last seen "on" (persisted)
+    readonly HashSet<string> _knownTiles = new(StringComparer.OrdinalIgnoreCase); // tiles that were already up when the widget started
+    readonly HashSet<string> _rememberedAtStart = new(StringComparer.OrdinalIgnoreCase);   // new tiles whose conversation was remembered as they appeared
     readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current tile
+    readonly Dictionary<(long Pid, long ProcStart), int> _procMiss = new();       // consecutive ticks a tracked process went unlisted
     readonly Dictionary<long, (string Name, long Created)> _pidSeen = new();       // what each registered pid was when first seen
     readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new tile <- same process swapped ids
     readonly Dictionary<string, long> _tileSince = new(StringComparer.OrdinalIgnoreCase);   // when each tile appeared (Remember restores only then)
@@ -756,9 +760,18 @@ sealed class WidgetForm : Form
                 SessionSwapped(old, kv.Key);
             _procSid[proc] = kv.Key;
         }
+        // Forget a process only after the same miss budget as a tile: one torn read of its entry
+        // (Claude rewriting it - as /clear does) mustn't lose the swap that's about to show.
         if (regUsable)
             foreach (var proc in new List<(long Pid, long ProcStart)>(_procSid.Keys))
-                if (!procs.Contains(proc)) _procSid.Remove(proc);
+            {
+                if (procs.Contains(proc)) { _procMiss.Remove(proc); continue; }
+                int n = _procMiss.TryGetValue(proc, out var c) ? c + 1 : 1;
+                if (n >= RegMissesToPrune) { _procSid.Remove(proc); _procMiss.Remove(proc); }
+                else _procMiss[proc] = n;
+            }
+        foreach (var kv in new List<KeyValuePair<string, (long At, bool WasOn)>>(_swapped))
+            if (NowMs() - kv.Value.At > 10_000) _swapped.Remove(kv.Key);   // its new id never showed
 
         var metas = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         try { foreach (var f in Directory.GetFiles(SessionsDir, "*.meta")) metas[Path.GetFileNameWithoutExtension(f)] = f; }
@@ -823,7 +836,11 @@ sealed class WidgetForm : Form
                 && reg.TryGetValue(sid, out var pre) && pre.Status.Length == 0) continue;
 
             var s = _sessions.TryGetValue(sid, out var existing) ? existing : new Session();
-            if (!_tileSince.ContainsKey(sid)) _tileSince[sid] = NowMs();
+            if (!_tileSince.ContainsKey(sid))
+            {
+                _tileSince[sid] = NowMs();
+                if (_remembered.ContainsKey(SidOf(sid))) _rememberedAtStart.Add(sid);
+            }
             string start = "";   // how this id's SessionStart came about (startup|resume|clear|compact)
             if (metaPath != null)
             {
@@ -856,17 +873,19 @@ sealed class WidgetForm : Form
                 if (fresh || NowMs() - sw.At > 10_000) _swapped.Remove(sid);
             }
             // No switch at all = this run hasn't decided: a widget start wiped it, or a resume did.
-            // A remembered session gets its autopilot back. (An explicit "off" is never overridden.)
-            // Only while the tile is new (its own SessionStart may still wipe the switch): a second
-            // window on the same conversation that you've left manual must not follow the first.
-            if (st == null && _remember && _remembered.ContainsKey(SidOf(sid))
-                && NowMs() - _tileSince[sid] < RestoreWindowMs)
+            // Only while the tile is new (its own SessionStart may still wipe the switch), it gets
+            // back what you chose. A window that was already up when the widget started: exactly its
+            // own last setting, so one you left manual stays manual beside one that's on. A window
+            // new since (a resume): its conversation's, if that was remembered before it appeared -
+            // switching one window on mustn't drag along others that just opened.
+            bool restore = _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);
+            if (st == null && _remember && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)
             {
                 try { WriteAtomic(statePath, "on"); st = "on"; _remembered[SidOf(sid)] = NowMs(); _configDirty = true; } catch { }
             }
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
             // Track the switch only while it exists: SessionEnd deletes it just before a swap shows.
-            if (st != null) { if (s.Hooking) _lastOn.Add(sid); else _lastOn.Remove(sid); }
+            if (st != null && (s.Hooking ? _lastOn.Add(sid) : _lastOn.Remove(sid))) _configDirty = true;
             _sessions[sid] = s;
             live.Add(sid);
         }
@@ -896,6 +915,7 @@ sealed class WidgetForm : Form
                 changed = true;
             }
         if (changed || _configDirty) { _configDirty = false; SaveConfig(); }
+        _rememberedAtStart.RemoveWhere(t => !_tileSince.ContainsKey(t));
 
         // Apply /name and live busy/idle status from the registry we already loaded.
         foreach (var kv in _sessions)
@@ -1004,11 +1024,18 @@ sealed class WidgetForm : Form
     static bool ProcessAlive(long pid, Dictionary<long, (string Name, long Created)> pidSeen)
     {
         if (pid > uint.MaxValue) return true;
+        // Seen dead: forget what this pid was, so a Claude that Windows later gives the same pid
+        // (rewriting the dead one's entry, which a kill leaves behind) is judged afresh.
         var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
-        if (h == IntPtr.Zero) return Marshal.GetLastWin32Error() != ERROR_INVALID_PARAMETER;   // 87 = no such process
+        if (h == IntPtr.Zero)
+        {
+            if (Marshal.GetLastWin32Error() != ERROR_INVALID_PARAMETER) return true;   // 87 = no such process
+            pidSeen.Remove(pid);
+            return false;
+        }
         try
         {
-            if (GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE) return false;
+            if (GetExitCodeProcess(h, out uint code) && code != STILL_ACTIVE) { pidSeen.Remove(pid); return false; }
             var sb = new System.Text.StringBuilder(1024);
             int len = sb.Capacity;
             if (!QueryFullProcessImageName(h, 0, sb, ref len)
@@ -1542,7 +1569,13 @@ sealed class WidgetForm : Form
                         foreach (var kv in c.Autopilot ?? new Dictionary<string, long>())
                             if (kv.Key.Length > 0 && SafeId(kv.Key) && kv.Value >= cutoff && kv.Value <= now + 86_400_000)
                                 _remembered[kv.Key] = kv.Value;
+                        // Which windows were on. Only with Remember: what it says is "on" also counts
+                        // as on for a /clear carry-over, and without Remember every window starts manual.
+                        foreach (var sid in c.OnTiles ?? new List<string>())
+                            if (!string.IsNullOrEmpty(sid) && SafeTileId(sid)) _lastOn.Add(sid);
                     }
+                    // Windows up before this start: Remember gives each back its own setting.
+                    _knownTiles.UnionWith(_order); _knownTiles.UnionWith(_dismissed); _knownTiles.UnionWith(_lastOn);
                     // HomeSet, or (legacy configs, which used -1 for "unset") non-negative coords.
                     if (c.HomeSet || (c.X >= 0 && c.Y >= 0))
                     {
@@ -1587,7 +1620,7 @@ sealed class WidgetForm : Form
                 // remembered spot.
                 X = _home.X, Y = _home.Y, HomeSet = _homeSet, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
                 Anchor = _anchor, NewSide = _newSide, Order = new(_order), Dismissed = new(_dismissed),
-                RememberAutopilot = _remember, Autopilot = new(_remembered),
+                RememberAutopilot = _remember, Autopilot = new(_remembered), OnTiles = new(_lastOn),
                 HomeRight = _relRight, HomeBottom = _relBottom,
                 HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,
             }));

@@ -52,7 +52,7 @@ $widgetCfg = Join-Path $env:USERPROFILE '.claude\hooker\widget.json'
 if (Test-Path $widgetCfg) {
     try {
         $w = Get-Content $widgetCfg -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($k in 'RememberAutopilot', 'Autopilot') { $w.PSObject.Properties.Remove($k) }
+        foreach ($k in 'RememberAutopilot', 'Autopilot', 'OnTiles') { $w.PSObject.Properties.Remove($k) }
         [System.IO.File]::WriteAllText($widgetCfg, ($w | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding $false))
     }
     catch { Remove-Item $widgetCfg -Force -ErrorAction SilentlyContinue }   # unreadable: drop it (just position/order)
