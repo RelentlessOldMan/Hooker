@@ -64,7 +64,7 @@ try
     catch { /* no/invalid payload */ }
 
     if (sid.Length == 0) return 0; // nothing session-scoped to do
-    long owner = Owner.Find(registryDir);
+    long owner = Owner.Find(registryDir, sid);
     var tile = owner > 0 ? Sanitize(sid) + "@" + owner : Sanitize(sid);
 
     var metaPath = Path.Combine(sessionsDir, tile + ".meta");
@@ -213,13 +213,15 @@ return 0;
 
 // Which Claude process fired this hook. Claude lists each running session in its registry as
 // <pid>.json, and runs hooks as its own descendants (through a shell), so the nearest ancestor
-// with a registry entry is ours. That holds however Claude is installed - nothing here looks
-// at names or paths. 0 = not found (no registry, or this process already delisted - its
-// SessionEnd): never guess by session id, which another window of the same conversation shares
-// and whose files it would then wipe.
+// whose entry names THIS session is ours. That holds however Claude is installed - nothing here
+// looks at names or paths. An ancestor listed under another session is skipped: an outer Claude
+// that started this one (a nested Claude never lists itself), or a dead Claude's leftover entry
+// whose pid Windows gave to the shell running this hook. 0 = not found (no registry, or this
+// process already delisted - its SessionEnd): never guess by session id alone, which another
+// window of the same conversation shares and whose files it would then wipe.
 static class Owner
 {
-    public static long Find(string registryDir)
+    public static long Find(string registryDir, string sid)
     {
         try
         {
@@ -229,11 +231,23 @@ static class Owner
             for (int depth = 0; depth < 16 && parents.TryGetValue(pid, out var parent) && parent > 0; depth++)
             {
                 pid = parent;
-                if (File.Exists(Path.Combine(registryDir, pid + ".json"))) return pid;
+                if (ListedAs(Path.Combine(registryDir, pid + ".json")) == sid) return pid;
             }
             return 0;
         }
         catch { return 0; }
+    }
+
+    // The session id a registry entry names, or null (no entry, or unreadable mid-write).
+    static string? ListedAs(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var doc = JsonDocument.Parse(fs);
+            return doc.RootElement.TryGetProperty("sessionId", out var s) ? s.GetString() : null;
+        }
+        catch { return null; }
     }
 
     // pid -> parent pid for every process, from one snapshot.

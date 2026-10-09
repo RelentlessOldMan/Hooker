@@ -805,8 +805,9 @@ sealed class WidgetForm : Form
             else _regMiss.Remove(sid);
 
             // A bare-id .meta for a session the registry places in a process (shared by two
-            // windows, so it couldn't be adopted): not a tile of its own. Pruned once old.
-            if (!sid.Contains('@') && bySid.ContainsKey(sid)) continue;
+            // windows, so it couldn't be adopted): not a tile of its own. Pruned once old. Unless
+            // the registry itself lists it bare (an entry without a pid): then it IS the tile.
+            if (!sid.Contains('@') && bySid.TryGetValue(sid, out var placed) && !placed.Contains(sid)) continue;
 
             if (_dismissed.Contains(sid))
             {
