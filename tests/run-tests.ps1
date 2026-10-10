@@ -167,7 +167,7 @@ $bugs = @(
        Find = 'pre.Status.Length == 0) continue;'; Bug = 'pre.Status.Length < 0) continue;'
        Scenario = 'picker' },
     @{ Name = 'killed Claude keeps its tile (06faeda)'; File = 'tray\Program.cs'
-       Find = 'if (!ProcessAlive(pid, pidSeen)) { deadAt[pid] = written; continue; }'; Bug = ''
+       Find = 'if (!ProcessAlive(pid, pidSeen)) { deadAt[file] = written; continue; }'; Bug = ''
        Scenario = 'killed Claude' },
     @{ Name = 'sessions sharing a process seen as /clear swaps every tick (68e8f83)'; File = 'tray\Program.cs'
        Find = 'var key = (kv.Value.File, kv.Value.ProcStart);'; Bug = 'var key = (kv.Value.Pid.ToString(), kv.Value.ProcStart);'
@@ -186,8 +186,8 @@ $bugs = @(
        Find = 'if (n >= RegMissesToPrune) { _fileSid.Remove(key);'; Bug = 'if (n >= 1) { _fileSid.Remove(key);'
        Scenario = 'tore just before' },
     @{ Name = 'Remember restores per conversation, not per window'; File = 'tray\Program.cs'
-       Find = "bool restore = _userSet.TryGetValue(sid, out var mine) ? mine`n                         : _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);"
-       Bug = 'bool restore = _remembered.ContainsKey(SidOf(sid));'
+       Find = "bool restore = _userSet.TryGetValue(sid, out var mine) ? mine`n                         : _remember && (_knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid));"
+       Bug = 'bool restore = _remember && _remembered.ContainsKey(SidOf(sid));'
        Scenario = 'each window gets its own' },
     @{ Name = 'Remember overrides a click in a new window''s first seconds (v1.0.34)'; File = 'tray\Program.cs'
        Find = '_userSet.TryGetValue(sid, out var mine) ? mine'; Bug = '_userSet.TryGetValue(sid, out var mine) && false ? mine'
@@ -213,6 +213,27 @@ $bugs = @(
     @{ Name = 'AskUserQuestion auto-answered on autopilot'; File = 'shim\Program.cs'
        Find = 'if (tool == "AskUserQuestion") { SetStatus("waiting"); break; }'; Bug = 'if (false) { SetStatus("waiting"); break; }'
        Scenario = 'AskUserQuestion' },
+    @{ Name = 'a click before a new window''s SessionStart is lost without Remember'; File = 'tray\Program.cs'
+       Find = 'if (st == null && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)'; Bug = 'if (st == null && _remember && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)'
+       Scenario = 'before its SessionStart' },
+    @{ Name = 'a reopened conversation goes to the end of the strip'; File = 'tray\Program.cs'
+       Find = 'int at = alone ? SlotFor(sid) : -1;'; Bug = 'int at = -1;'
+       Scenario = 'old slot' },
+    @{ Name = 'slots forgotten on a widget restart'; File = 'tray\Program.cs'
+       Find = 'foreach (var sid in c.Slots is { Count: > 0 } ? c.Slots : _order.Select(SidOf).ToList())'; Bug = 'foreach (var sid in _order.Select(SidOf).ToList())'
+       Scenario = 'old slot' },
+    @{ Name = 'a stale entry judged by whatever holds its pid now (reboot ghost)'; File = 'tray\Program.cs'
+       Find = 'if (!pidSeen.ContainsKey(pid) && (rec ?? Recorded(tile)) is { } hooked) pidSeen[pid] = hooked;'; Bug = ''
+       Scenario = 'stale registry entry' },
+    @{ Name = 'hook doesn''t record its Claude process'; File = 'shim\Program.cs'
+       Find = '(m.exe, m.created) = self ?? ("", 0);'; Bug = ''
+       Scenario = 'stale registry entry' },
+    @{ Name = 'dead entries forgotten on a widget restart'; File = 'tray\Program.cs'
+       Find = '&& kv.Value > 0) _deadAt[kv.Key] = kv.Value;'; Bug = '&& kv.Value < 0) _deadAt[kv.Key] = kv.Value;'
+       Scenario = 'stale registry entry' },
+    @{ Name = 'an out-of-date process record hides a live window'; File = 'tray\Program.cs'
+       Find = 'if (rec == null && (written == 0 || written == was)) continue;'; Bug = 'if (written == 0 || written == was) continue;'
+       Scenario = 'earlier process' },
     @{ Name = 'hook exits non-zero'; File = 'shim\Program.cs'
        Find = "return 0;`n`n// Which Claude process"; Bug = "return 1;`n`n// Which Claude process"
        Scenario = 'fresh session' }

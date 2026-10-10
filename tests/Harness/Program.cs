@@ -560,6 +560,85 @@ static class Scenarios
             e.Until(() => e.Tile(T(s, a))?.Count == 5 && !e.Has(s), "adopted with its tally");
             e.Until(() => e.ConfigOrder().SequenceEqual(new[] { T(s, a) }), "saved order migrated");
         }),
+
+        ("a new window you switch on before its SessionStart stays on", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            a.Register(s);                                 // listed; its SessionStart hasn't run yet
+            e.Until(() => e.Has(T(s, a)), "tile");
+            e.Click(T(s, a));
+            e.Until(() => e.On(T(s, a)), "on");
+            a.Hook("SessionStart", s, source: "startup");  // a new session's start wipes the switch
+            e.Until(() => File.Exists(e.State(T(s, a))), "switch put back");
+            e.Hold(() => e.On(T(s, a)), 1500, "still on");
+            e.Expect(e.Tool(a, s), "auto-approves");
+        }),
+
+        ("a conversation reopened in a new window gets its old slot back", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var b = e.NewClaude(); var c = e.NewClaude(); string s1 = Sid(), s2 = Sid(), s3 = Sid();
+            e.Start(a, s1); e.Until(() => e.Has(T(s1, a)), "first tile");
+            e.Start(b, s2); e.Until(() => e.Has(T(s2, b)), "second tile");
+            e.Start(c, s3); e.Until(() => e.Has(T(s3, c)), "third tile");
+            e.Close(b, s2);
+            e.Until(() => !e.Has(T(s2, b)), "middle one closed", 5000);
+            var b2 = e.NewClaude();
+            e.Start(b2, s2, "resume");
+            e.Until(() => e.Has(T(s2, b2)), "reopened");
+            e.Expect(e.Ids().SequenceEqual(new[] { T(s1, a), T(s2, b2), T(s3, c) }), "back in the middle");
+            // Everything closes (a reboot), the widget restarts, and they come back in another order.
+            e.Close(a, s1); e.Close(b2, s2); e.Close(c, s3);
+            e.Until(() => e.Tiles().Count == 0, "all closed", 5000);
+            e.KillWidget();
+            e.StartWidget();
+            var a2 = e.NewClaude(); var b3 = e.NewClaude(); var c2 = e.NewClaude();
+            e.Start(c2, s3, "resume"); e.Until(() => e.Has(T(s3, c2)), "third back");
+            e.Start(a2, s1, "resume"); e.Until(() => e.Has(T(s1, a2)), "first back");
+            e.Start(b3, s2, "resume"); e.Until(() => e.Has(T(s2, b3)), "second back");
+            e.Expect(e.Ids().SequenceEqual(new[] { T(s1, a2), T(s2, b3), T(s3, c2) }), "the old order");
+        }),
+
+        ("a stale registry entry whose pid another process now holds gets no tile", () =>
+        {
+            var a = e.NewClaude(); var x = e.NewClaude(); var s = Sid();
+            e.Start(a, s);                                 // a's hook records a's process
+            var meta = File.ReadAllText(e.Meta(T(s, a)));
+            a.Kill();
+            // A reboot later: a's entry and status file are left over, and its pid now belongs to
+            // some other process. x stands in for that process (it never lists itself).
+            File.Delete(Path.Combine(e.Registry, a.Pid + ".json"));
+            File.Delete(e.Meta(T(s, a)));
+            x.Register(s);
+            File.WriteAllText(e.Meta(T(s, x)), meta);
+            e.Age(Path.Combine(e.Registry, x.Pid + ".json"), e.Meta(T(s, x)));
+            e.StartWidget();
+            e.Until(() => !e.Has(T(s, x)), "no tile for it", 5000);
+            e.Hold(() => !e.Has(T(s, x)), 2000, "it stays gone");
+            e.KillWidget();                                // its status file is gone now
+            e.StartWidget();
+            e.Hold(() => !e.Has(T(s, x)), 2500, "still none after a widget restart");
+        }),
+
+        ("a window whose status file names an earlier process still gets its tile", () =>
+        {
+            var old = e.NewClaude(); var a = e.NewClaude(); var s = Sid();
+            old.Register(s); old.Hook("Stop", s); old.Unregister();   // a status file naming old's process
+            var meta = File.ReadAllText(e.Meta(T(s, old)));
+            File.Delete(e.Meta(T(s, old)));
+            old.Kill();
+            // A crash left a status file under this very tile id: same conversation, and Windows
+            // gave the new window's Claude the old one's pid.
+            File.WriteAllText(e.Meta(T(s, a)), meta);
+            e.Age(e.Meta(T(s, a)));
+            e.StartWidget();
+            a.Register(s, status: "busy");
+            e.WaitTicks(3);                                // judged by the old record: not this process
+            a.Hook("SessionStart", s, source: "resume");   // its hook records the real one
+            e.Until(() => e.Tile(T(s, a))?.Working == true, "listed again: Claude's own busy status shows");
+            e.Hold(() => e.Has(T(s, a)), 2000, "tile stays");
+        }),
     };
 }
 
@@ -668,6 +747,8 @@ sealed class Env
         Until(() => !File.Exists(path), "widget took the click");
     }
 
+    // Files left from before the widget started (a reboot ago).
+    public void Age(params string[] files) { foreach (var f in files) File.SetLastWriteTimeUtc(f, DateTime.UtcNow.AddHours(-1)); }
     public string Meta(string tile) => Path.Combine(Sessions, tile + ".meta");
     public string State(string tile) => Path.Combine(Sessions, tile + ".state");
     public List<string> SessionFiles() =>
@@ -719,6 +800,7 @@ sealed class Env
         return tiles;
     }
     public Tile? Tile(string id) => Tiles().FirstOrDefault(t => t.Id == id);
+    public List<string> Ids() => Tiles().Select(t => t.Id).ToList();
     public bool Has(string id) => Tile(id) != null;
     public bool On(string id) => Tile(id)?.On == true;
     public string Describe()

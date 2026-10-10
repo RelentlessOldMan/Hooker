@@ -105,6 +105,15 @@ sealed class WidgetConfig
     public Dictionary<string, long> Autopilot { get; set; } = new();
     public List<string> OnTiles { get; set; } = new();
 
+    // Registry entries found dead (file -> its last write then): one a crash or reboot left behind
+    // stays dead across a widget restart for as long as it's unchanged, whatever holds its pid now.
+    public Dictionary<string, long> DeadEntries { get; set; } = new();
+
+    // Session ids in strip order, including ones whose window has closed (with when it closed), so
+    // a conversation resumed in a new window gets its old slot back.
+    public List<string> Slots { get; set; } = new();
+    public Dictionary<string, long> SlotGone { get; set; } = new();
+
     // Strip width when X/Y was captured, in logical (DPI-independent) px; 0 = legacy/unknown.
     // X/Y is a top-left corner, so if the strip comes back a different width (sessions came/went,
     // meter toggled) a right-anchored strip must shift by the difference to keep its RIGHT edge.
@@ -165,9 +174,14 @@ sealed class WidgetForm : Form
     readonly Dictionary<(string File, long ProcStart), string> _fileSid = new();  // registry entry -> the tile it lists
     readonly Dictionary<(string File, long ProcStart), int> _fileMiss = new();    // consecutive ticks a tracked entry went unread
     readonly Dictionary<long, (string Name, long Created)> _pidSeen = new();       // what each registered pid was when first seen
-    readonly Dictionary<long, long> _deadAt = new();                               // pid seen dead -> its entry's last write then
+    readonly Dictionary<string, long> _deadAt = new(StringComparer.OrdinalIgnoreCase);   // registry file seen dead -> its last write then (persisted)
     readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new tile <- same process swapped ids
     readonly Dictionary<string, long> _tileSince = new(StringComparer.OrdinalIgnoreCase);   // when each tile appeared (Remember restores only then)
+    long _deadSig;                                                                // _deadAt as last saved (see DeadSig)
+    readonly List<string> _slots = new();                                         // session ids in strip order, closed ones too (persisted)
+    readonly Dictionary<string, long> _slotGone = new(StringComparer.OrdinalIgnoreCase);   // closed ones in _slots -> when they closed
+    const long SlotDays = 30;                   // forget a closed window's slot after this long...
+    const int SlotsKept = 50;                   // ...or when more than this many have closed
     int _stateSweep;                                                              // throttles the stale-.state sweep
     bool _meterOn = true;                       // the left "two-tile" system meter
     bool _remember;                             // "Remember autopilot" (opt-in)
@@ -739,6 +753,8 @@ sealed class WidgetForm : Form
         // so the last tile goes away too.
         var reg = LoadRegistry(_pidSeen, _deadAt, out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
+        long deadSig = DeadSig();
+        if (deadSig != _deadSig) { _deadSig = deadSig; _configDirty = true; }
 
         // Each listed session id's tiles. A tile named by the bare id is one the hook couldn't
         // place in a process; once the registry lists that session it's either adopted (an
@@ -883,16 +899,22 @@ sealed class WidgetForm : Form
             }
             // No switch at all = this run hasn't decided: a widget start wiped it, or a resume did.
             // Only while the tile is new (its own SessionStart may still wipe the switch), it gets
-            // back what you chose. A window that was already up when the widget started: exactly its
-            // own last setting, so one you left manual stays manual beside one that's on. A window
-            // new since (a resume): its conversation's, if that was remembered before it appeared -
-            // switching one window on mustn't drag along others that just opened. And one you've
-            // clicked or dismissed since gets exactly what you chose, even if its SessionStart wiped it.
+            // back what you chose. One you've clicked or dismissed since gets exactly that, Remember
+            // or not: a new window's SessionStart can land after you've already switched it on.
+            // With Remember, a window that was already up when the widget started gets exactly its
+            // own last setting, so one you left manual stays manual beside one that's on; a window
+            // new since (a resume), its conversation's, if that was remembered before it appeared -
+            // switching one window on mustn't drag along others that just opened.
             bool restore = _userSet.TryGetValue(sid, out var mine) ? mine
-                         : _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);
-            if (st == null && _remember && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)
+                         : _remember && (_knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid));
+            if (st == null && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)
             {
-                try { WriteAtomic(statePath, "on"); st = "on"; _remembered[SidOf(sid)] = NowMs(); _configDirty = true; } catch { }
+                try
+                {
+                    WriteAtomic(statePath, "on"); st = "on";
+                    if (_remember) { _remembered[SidOf(sid)] = NowMs(); _configDirty = true; }
+                }
+                catch { }
             }
             s.Hooking = st != null && st.Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
             // Track the switch only while it exists: SessionEnd deletes it just before a swap shows.
@@ -922,7 +944,11 @@ sealed class WidgetForm : Form
         foreach (var sid in live)
             if (!_order.Contains(sid))
             {
-                if (_newSide == "left") _order.Insert(0, sid); else _order.Add(sid);
+                // A conversation back in a new window (and in no other) goes back to its old slot.
+                bool alone = !bySid.TryGetValue(SidOf(sid), out var windows) || windows.Count < 2;
+                int at = alone ? SlotFor(sid) : -1;
+                if (at >= 0) _order.Insert(at, sid);
+                else if (_newSide == "left") _order.Insert(0, sid); else _order.Add(sid);
                 changed = true;
             }
         if (changed || _configDirty) { _configDirty = false; SaveConfig(); }
@@ -971,12 +997,72 @@ sealed class WidgetForm : Form
         DeleteSessionFiles(old);   // it has ended (its SessionEnd does the same); no lingering tile
     }
 
+    // Changes whenever _deadAt does (order-independent), so the sync knows to save it.
+    long DeadSig()
+    {
+        long h = _deadAt.Count;
+        foreach (var kv in _deadAt) h += (StringComparer.OrdinalIgnoreCase.GetHashCode(kv.Key) * 1_000_003L) ^ kv.Value;
+        return h;
+    }
+
+    int SlotOf(string sid) => _slots.FindIndex(x => x.Equals(sid, StringComparison.OrdinalIgnoreCase));
+
+    // Where a new tile goes when its conversation had a slot: right after the last tile whose
+    // conversation came before it, else just before the first that came after. -1 = no slot (or
+    // nothing to place it by): the usual side.
+    int SlotFor(string tile)
+    {
+        int rank = SlotOf(SidOf(tile));
+        if (rank < 0) return -1;
+        int after = -1, before = -1;
+        for (int i = 0; i < _order.Count; i++)
+        {
+            int r = SlotOf(SidOf(_order[i]));
+            if (r < 0 || r == rank) continue;
+            if (r < rank) after = i + 1;
+            else if (before < 0) before = i;
+        }
+        return after >= 0 ? after : before;
+    }
+
+    // Bring _slots up to date with the strip: open conversations in strip order, each closed one
+    // kept right after the one it followed (so it moves with it), until it ages out.
+    void UpdateSlots()
+    {
+        var open = new List<string>();
+        var isOpen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in _order) if (isOpen.Add(SidOf(t))) open.Add(SidOf(t));
+        long now = NowMs();
+        var lead = new List<string>();
+        var follows = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        string? prev = null;
+        foreach (var s in _slots)
+        {
+            if (isOpen.Contains(s)) { prev = s; continue; }
+            if (!_slotGone.TryGetValue(s, out var gone)) _slotGone[s] = gone = now;
+            if (now - gone > SlotDays * 86_400_000) continue;
+            if (prev == null) lead.Add(s);
+            else { if (!follows.TryGetValue(prev, out var l)) follows[prev] = l = new(); l.Add(s); }
+        }
+        _slots.Clear();
+        _slots.AddRange(lead);
+        foreach (var s in open)
+        {
+            _slots.Add(s);
+            _slotGone.Remove(s);
+            if (follows.TryGetValue(s, out var l)) _slots.AddRange(l);
+        }
+        var closed = _slots.Where(s => !isOpen.Contains(s)).OrderBy(s => _slotGone[s]).ToList();
+        for (int i = 0; i < closed.Count - SlotsKept; i++) _slots.Remove(closed[i]);
+        foreach (var k in _slotGone.Keys.ToList()) if (SlotOf(k) < 0) _slotGone.Remove(k);
+    }
+
     // Read Claude Code's per-session registry (~/.claude/sessions/<pid>.json): maps our
     // session id -> what Claude knows about it. This is both our liveness signal and (since a
     // live session may have no .meta yet) the list of tiles to show. Undocumented/internal, so
     // best-effort - any failure just drops that entry and we fall back to folder + hook signal.
     static Dictionary<string, RegInfo> LoadRegistry(Dictionary<long, (string Name, long Created)> pidSeen,
-                                                    Dictionary<long, long> deadAt, out bool usable)
+                                                    Dictionary<string, long> deadAt, out bool usable)
     {
         var map = new Dictionary<string, RegInfo>(StringComparer.OrdinalIgnoreCase);
         usable = false;
@@ -1010,18 +1096,27 @@ sealed class WidgetForm : Form
                     if (pid > 0)
                     {
                         pids.Add(pid);
+                        var tile = sid + "@" + pid;
+                        var file = Path.GetFileName(f);
                         // Once seen dead, an entry stays dead for as long as it's left unchanged -
                         // whatever process Windows hands its pid to next (a hook's shell, git...),
                         // which would otherwise bring the dead tile back. Rewritten means a new
-                        // Claude got that pid: judge it afresh.
+                        // Claude got that pid: judge it afresh. So does its hook recording which
+                        // process it runs in (a window resumed in a Claude that got the same pid).
                         long written;
                         try { written = File.GetLastWriteTimeUtc(f).Ticks; } catch { written = 0; }
-                        if (deadAt.TryGetValue(pid, out var was))
+                        (string, long)? rec = null;
+                        if (deadAt.TryGetValue(file, out var was))
                         {
-                            if (written == 0 || written == was) continue;
-                            deadAt.Remove(pid); pidSeen.Remove(pid);
+                            rec = Recorded(tile);
+                            if (rec == null && (written == 0 || written == was)) continue;
+                            deadAt.Remove(file); pidSeen.Remove(pid);
                         }
-                        if (!ProcessAlive(pid, pidSeen)) { deadAt[pid] = written; continue; }
+                        // First sight of this pid: the process the hook recorded is the one Claude
+                        // listed, a better yardstick than whatever holds the pid now - after a
+                        // reboot, a stale entry's pid can belong to anything.
+                        if (!pidSeen.ContainsKey(pid) && (rec ?? Recorded(tile)) is { } hooked) pidSeen[pid] = hooked;
+                        if (!ProcessAlive(pid, pidSeen)) { deadAt[file] = written; continue; }
                     }
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
@@ -1038,18 +1133,33 @@ sealed class WidgetForm : Form
             {
                 foreach (var pid in new List<long>(pidSeen.Keys))
                     if (!pids.Contains(pid)) pidSeen.Remove(pid);
-                foreach (var pid in new List<long>(deadAt.Keys))
-                    if (!pids.Contains(pid)) deadAt.Remove(pid);
+                var listed = new HashSet<string>(files.Select(x => Path.GetFileName(x)), StringComparer.OrdinalIgnoreCase);
+                foreach (var file in new List<string>(deadAt.Keys))
+                    if (!listed.Contains(file)) deadAt.Remove(file);
             }
         }
         catch { }
         return map;
     }
 
+    // What the tile's hook recorded about its own Claude process (exe name, creation time), or null:
+    // no .meta, an older hook, or the process couldn't be read.
+    static (string Name, long Created)? Recorded(string tile)
+    {
+        try
+        {
+            var text = ReadShared(Path.Combine(SessionsDir, tile + ".meta"));
+            var m = text != null ? JsonSerializer.Deserialize<MetaDto>(text) : null;
+            return m != null && !string.IsNullOrEmpty(m.exe) && m.created != 0 ? (m.exe, m.created) : null;
+        }
+        catch { return null; }
+    }
+
     // Is this pid still the process Claude registered? Dead = no such process, it has exited, or the
     // pid now belongs to a different process (a crashed Claude's pid reused): its exe name or creation
-    // time differs from what WE saw the first time this pid was listed. Both come from Windows, so
-    // this holds however Claude is installed. Deliberately NOT compared against the entry's procStart:
+    // time differs from what the hook recorded, or else from what WE saw the first time this pid was
+    // listed. All of it comes from Windows, the same call on both sides, so it matches exactly for
+    // the same process however Claude is installed. Deliberately NOT compared against the entry's procStart:
     // that doesn't match the creation time exactly on every machine, and a mismatch evicted every
     // live, idle session (v1.0.26-29). Anything we can't determine counts as alive.
     static bool ProcessAlive(long pid, Dictionary<long, (string Name, long Created)> pidSeen)
@@ -1169,6 +1279,8 @@ sealed class WidgetForm : Form
         public string start { get; set; } = "";
         public string cwd { get; set; } = "";
         public long count { get; set; }
+        public string exe { get; set; } = "";   // the hook's Claude process (see Recorded)
+        public long created { get; set; }
     }
 
     // ---- geometry --------------------------------------------------------
@@ -1608,6 +1720,14 @@ sealed class WidgetForm : Form
                     }
                     // Windows up before this start: Remember gives each back its own setting.
                     _knownTiles.UnionWith(_order); _knownTiles.UnionWith(_dismissed); _knownTiles.UnionWith(_lastOn);
+                    foreach (var kv in c.DeadEntries ?? new Dictionary<string, long>())
+                        if (kv.Key.Length > 0 && kv.Key.IndexOfAny(new[] { '/', '\\' }) < 0 && kv.Value > 0) _deadAt[kv.Key] = kv.Value;
+                    _deadSig = DeadSig();
+                    // Slots: as saved, or (from before they were saved) the strip as it was.
+                    foreach (var sid in c.Slots is { Count: > 0 } ? c.Slots : _order.Select(SidOf).ToList())
+                        if (!string.IsNullOrEmpty(sid) && SafeId(sid) && SlotOf(sid) < 0) _slots.Add(sid);
+                    foreach (var kv in c.SlotGone ?? new Dictionary<string, long>())
+                        if (SlotOf(kv.Key) >= 0) _slotGone[kv.Key] = kv.Value;
                     // HomeSet, or (legacy configs, which used -1 for "unset") non-negative coords.
                     if (c.HomeSet || (c.X >= 0 && c.Y >= 0))
                     {
@@ -1644,6 +1764,7 @@ sealed class WidgetForm : Form
     {
         try
         {
+            UpdateSlots();
             Directory.CreateDirectory(HookerDir);
             WriteAtomic(ConfigPath, JsonSerializer.Serialize(new WidgetConfig
             {
@@ -1653,6 +1774,7 @@ sealed class WidgetForm : Form
                 X = _home.X, Y = _home.Y, HomeSet = _homeSet, HomeW = _homeW, Locked = _locked, Meter = _meterOn,
                 Anchor = _anchor, NewSide = _newSide, Order = new(_order), Dismissed = new(_dismissed),
                 RememberAutopilot = _remember, Autopilot = new(_remembered), OnTiles = new(_lastOn),
+                DeadEntries = new(_deadAt), Slots = new(_slots), SlotGone = new(_slotGone),
                 HomeRight = _relRight, HomeBottom = _relBottom,
                 HomeGapX = _relValid ? _relGapX : -1, HomeGapY = _relValid ? _relGapY : -1,
             }));

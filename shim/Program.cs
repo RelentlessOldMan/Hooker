@@ -9,7 +9,7 @@
 //      (status working/waiting, cwd, auto-approval count) that the widget renders.
 //
 // State lives under %USERPROFILE%\.claude\hooker\sessions\, one pair per tile:
-//   <tile>.meta   {"status","cwd","count"}   (this shim writes; widget reads)
+//   <tile>.meta   {"status","cwd","count","start","exe","created"}   (this shim writes; widget reads)
 //   <tile>.state  "on"/"off"                 (widget writes; this shim reads)
 // A tile is one running Claude session: <sid>@<pid of its Claude process>. Two windows that
 // resume the same conversation share a session id, but each is its own session with its own
@@ -119,6 +119,12 @@ try
         }
         catch { }
     }
+    // Which process this window's Claude is: its exe name and creation time, both from Windows.
+    // The widget checks a registry entry's pid against this, so an entry a crash or reboot left
+    // behind - its pid since handed to some other process - can't pass for a live window. Written
+    // on every update, so it's always this process's; blank when it can't be read.
+    var self = owner > 0 ? Owner.Identity(owner) : null;
+
     // Claude fires tool hooks in parallel, so several shims can read-modify-write the same .meta
     // at once and lose an auto-approval count. Serialise per session with a named mutex; if it
     // can't be had quickly, carry on unlocked rather than ever stall Claude.
@@ -136,6 +142,7 @@ try
         {
             var m = ReadMeta();
             change(m);
+            (m.exe, m.created) = self ?? ("", 0);
             WriteMeta(m);
         }
         finally
@@ -276,6 +283,27 @@ static class Owner
         }
     }
 
+    // A process's exe file name and creation time, read exactly as the widget reads them, or null.
+    public static (string, long)? Identity(long pid)
+    {
+        try
+        {
+            if (pid > uint.MaxValue) return null;
+            var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+            if (h == IntPtr.Zero) return null;
+            try
+            {
+                var sb = new StringBuilder(1024);
+                int len = sb.Capacity;
+                if (!QueryFullProcessImageName(h, 0, sb, ref len) || !GetProcessTimes(h, out long created, out _, out _, out _)) return null;
+                var name = Path.GetFileName(sb.ToString());
+                return name.Length > 0 && created != 0 ? (name, created) : null;
+            }
+            finally { CloseHandle(h); }
+        }
+        catch { return null; }
+    }
+
     // pid -> parent pid for every process, from one snapshot.
     static Dictionary<long, long> Parents()
     {
@@ -307,6 +335,10 @@ static class Owner
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snap, ref PROCESSENTRY32W e);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr snap, ref PROCESSENTRY32W e);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder name, ref int size);
 }
 
 // Lowercase property names mirror the on-disk .meta JSON keys the widget reads.
@@ -316,4 +348,6 @@ sealed class Meta
     public string cwd { get; set; } = "";
     public long count { get; set; } = 0;
     public string start { get; set; } = "";   // SessionStart source: startup|resume|clear|compact
+    public string exe { get; set; } = "";     // this window's Claude process: exe file name...
+    public long created { get; set; } = 0;    // ...and creation time (FILETIME); see Owner.Identity
 }
