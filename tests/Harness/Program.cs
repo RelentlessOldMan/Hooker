@@ -50,6 +50,7 @@ foreach (var (name, body) in Scenarios.All(env))
     }
     finally { env.Teardown(); }
 }
+if (ran == 0) { Console.WriteLine($"no scenario matches '{filter}'"); return 3; }
 Console.WriteLine($"\n{ran - failed - skipped}/{ran} passed" + (skipped > 0 ? $", {skipped} skipped" : ""));
 return failed == 0 ? 0 : 1;
 
@@ -263,8 +264,8 @@ static class Scenarios
             e.StartWidget();
             var b = e.NewClaude(); var c = e.NewClaude();
             e.Start(b, s, "resume"); e.Start(c, other, "resume");
-            e.Until(() => e.On(T(s, b)), "remembered conversation back on");
-            e.Hold(() => !e.On(T(other, c)), 1500, "other conversation stays manual");
+            e.Until(() => e.On(T(s, b)) && e.Has(T(other, c)), "remembered conversation back on");
+            e.Hold(() => e.Has(T(other, c)) && !e.On(T(other, c)), 1500, "other conversation stays manual");
         }),
 
         ("hook of a Claude started inside another doesn't attach to the outer window [a6f98aa]", () =>
@@ -316,7 +317,7 @@ static class Scenarios
             e.Expect(!e.Tool(a, s), "a crashed widget grants nothing");
             e.StartWidget();
             e.Until(() => e.Has(T(s, a)), "tile back");
-            e.Hold(() => !e.On(T(s, a)), 1500, "back manual");
+            e.Hold(() => e.Has(T(s, a)) && !e.On(T(s, a)), 1500, "back manual");
             e.Expect(!e.Tool(a, s), "prompts");
         }),
 
@@ -342,8 +343,8 @@ static class Scenarios
             e.Until(() => e.On(T(s, a)) && !e.On(T(s, b)) && !e.On(T(s, c)), "a on, b and c manual");
             e.KillWidget();
             e.StartWidget();
-            e.Until(() => e.On(T(s, a)), "a back on");
-            e.Hold(() => !e.On(T(s, b)) && !e.On(T(s, c)), 2500, "b and c stay manual");
+            e.Until(() => e.On(T(s, a)) && e.Has(T(s, b)) && e.Has(T(s, c)), "a back on");
+            e.Hold(() => e.Has(T(s, b)) && e.Has(T(s, c)) && !e.On(T(s, b)) && !e.On(T(s, c)), 2500, "b and c stay manual");
             e.Expect(!e.Tool(b, s) && !e.Tool(c, s), "b and c prompt");
         }),
 
@@ -361,9 +362,11 @@ static class Scenarios
             e.KillWidget();
             e.StartWidget();
             e.Until(() => e.On(T(s, a)), "a back on");
+            e.Hold(() => !e.Has(T(s, b)), 2000, "b still dismissed after the restart");
             b.Hook("UserPromptSubmit", s);                 // b acts again: its tile returns...
             e.Until(() => e.Has(T(s, b)), "b's tile back");
-            e.Hold(() => !e.On(T(s, b)), 2000, "...manual");
+            e.Hold(() => e.Has(T(s, b)) && !e.On(T(s, b)), 2000, "...manual");
+            e.Expect(!e.Tool(b, s), "b prompts");
         }),
 
         ("without Remember, a window on before a widget restart stays manual through /clear", () =>
@@ -376,7 +379,8 @@ static class Scenarios
             e.Until(() => e.On(T(s1, a)), "on");
             e.KillWidget();
             e.StartWidget();
-            e.Until(() => e.Has(T(s1, a)) && !e.On(T(s1, a)), "back manual");
+            e.Until(() => e.Has(T(s1, a)), "tile back");
+            e.Hold(() => e.Has(T(s1, a)) && !e.On(T(s1, a)), 1000, "back manual");
             a.Hook("SessionEnd", s1);
             a.Register(s2);
             a.Hook("SessionStart", s2, source: "clear");
@@ -393,7 +397,7 @@ static class Scenarios
             e.Until(() => e.On(T(s1, a)), "on");
             // /clear: the widget catches Claude mid-rewrite of the entry, then sees the new id.
             File.WriteAllText(Path.Combine(e.Registry, a.Pid + ".json"), "{\"pid\":");
-            Thread.Sleep(350);
+            e.WaitTicks(3);
             a.Hook("SessionEnd", s1);
             a.Register(s2);
             a.Hook("SessionStart", s2, source: "clear");
@@ -414,6 +418,135 @@ static class Scenarios
             var s2 = Sid();
             b.Register(s2);                                // overwrites the dead entry, no hook yet
             e.Until(() => e.Has(T(s2, b)), "new Claude's tile, from the registry alone");
+        }),
+
+        ("a killed Claude's pid taken by another process doesn't bring its tile back", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s);
+            e.Until(() => e.Has(T(s, a)), "tile shown");
+            int pid = a.Pid;
+            a.Kill();                                      // its registry file stays behind
+            e.Until(() => !e.Has(T(s, a)), "killed tile gone", 5000);
+            _ = e.NewClaudeWithPid(pid) ?? throw new SkipException("Windows didn't hand out the same pid again");
+            e.Hold(() => !e.Has(T(s, a)), 2000, "the dead window stays gone");   // not a Claude: never lists itself
+        }),
+
+        ("auto-compact keeps autopilot and the tally", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s); e.SetOn(T(s, a));
+            e.Until(() => e.On(T(s, a)), "on");
+            e.Expect(e.Tool(a, s) && e.Tool(a, s), "approves");
+            e.Until(() => e.Tile(T(s, a))?.Count == 2, "2 approvals counted");
+            a.Hook("SessionStart", s, source: "compact");
+            e.Hold(() => e.On(T(s, a)) && e.Tile(T(s, a))?.Count == 2, 1500, "still on, tally kept");
+            e.Expect(e.Tool(a, s), "still approves");
+        }),
+
+        ("AskUserQuestion is never auto-approved, even on autopilot", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s); e.SetOn(T(s, a));
+            e.Until(() => e.On(T(s, a)), "on");
+            e.Expect(a.Hook("PreToolUse", s, tool: "AskUserQuestion") == "", "no decision: you answer it yourself");
+            e.Hold(() => e.On(T(s, a)) && e.Tile(T(s, a))?.Count == 0, 1000, "not counted as an approval");
+        }),
+
+        ("a hook that can't place its window gets a bare tile that works", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();          // never listed (no registry entry for it)
+            a.Hook("SessionStart", s, source: "startup");
+            e.Until(() => e.Has(s), "bare tile");
+            e.Expect(File.Exists(e.Meta(s)), "bare status file");
+            e.Click(s);
+            e.Until(() => e.On(s), "on");
+            e.Expect(e.Tool(a, s), "approves");
+            e.KillWidget();
+            e.Expect(!e.Tool(a, s), "nothing without the widget");
+        }),
+
+        ("an unreadable registry doesn't evict tiles", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s); e.SetOn(T(s, a));
+            e.Until(() => e.On(T(s, a)), "on");
+            var f = Path.Combine(e.Registry, a.Pid + ".json");
+            var good = File.ReadAllText(f);
+            File.WriteAllText(f, "{\"pid\":");             // the only entry, unreadable: nothing to judge by
+            e.WaitTicks(25);                               // well past the miss budget
+            e.Expect(e.Has(T(s, a)) && e.On(T(s, a)), "tile kept, still on");
+            File.WriteAllText(f, good);
+            e.Hold(() => e.Has(T(s, a)) && e.On(T(s, a)), 1000, "and after");
+            e.Expect(File.Exists(e.Meta(T(s, a))), "its status file kept");
+        }),
+
+        ("torn reads of sessions sharing a process don't swap them", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); string s1 = Sid(), s2 = Sid();
+            a.Register(s1);
+            a.Register(s2, file: a.Pid + "-2.json");
+            a.Hook("SessionStart", s1, source: "startup");
+            a.Hook("SessionStart", s2, source: "clear");   // s2 came from a /clear: a false swap would switch it on
+            e.Until(() => e.Has(T(s1, a)) && e.Has(T(s2, a)), "a tile per session");
+            e.SetOn(T(s1, a));
+            e.Until(() => e.On(T(s1, a)), "s1 on");
+            string f1 = Path.Combine(e.Registry, a.Pid + ".json"), f2 = Path.Combine(e.Registry, a.Pid + "-2.json");
+            string good1 = File.ReadAllText(f1), good2 = File.ReadAllText(f2);
+            File.WriteAllText(f2, "{\"pid\":");            // the widget reads s1 alone...
+            e.WaitTicks(3);
+            File.WriteAllText(f1, "{\"pid\":");            // ...then s2 alone
+            File.WriteAllText(f2, good2);
+            e.WaitTicks(3);
+            File.WriteAllText(f1, good1);
+            e.Hold(() => e.On(T(s1, a)) && e.Has(T(s2, a)) && !e.On(T(s2, a)), 2000, "s1 keeps autopilot, s2 stays manual");
+            e.Expect(e.Tiles()[0].Id == T(s1, a), "s1 kept its slot");
+            e.Expect(e.Tool(a, s1) && !e.Tool(a, s2), "s1 approves, s2 prompts");
+        }),
+
+        ("Remember: your click in a new window's first seconds stands", () =>
+        {
+            string s = Sid(), s2 = Sid();
+            e.WriteConfig(remember: true, autopilot: new() { [s] = Env.NowMs(), [s2] = Env.NowMs() });
+            e.StartWidget();
+            var b = e.NewClaude(); var c = e.NewClaude();
+            b.Register(s); c.Register(s2);                 // resumed windows, listed before their SessionStart
+            e.Until(() => e.On(T(s, b)) && e.On(T(s2, c)), "remembered conversations back on");
+            e.Click(T(s, b));                              // you switch b off...
+            e.Dismiss(T(s2, c));                           // ...and dismiss c
+            e.Until(() => e.Has(T(s, b)) && !e.On(T(s, b)) && !e.Has(T(s2, c)), "b off, c hidden");
+            b.Hook("SessionStart", s, source: "resume");   // their SessionStart wipes the switch
+            c.Hook("SessionStart", s2, source: "resume");  // and c acting brings its tile back
+            e.Until(() => e.Has(T(s2, c)), "c's tile back");
+            e.Hold(() => e.Has(T(s, b)) && !e.On(T(s, b)) && e.Has(T(s2, c)) && !e.On(T(s2, c)), 2000, "both stay as you left them");
+            e.Expect(!e.Tool(b, s) && !e.Tool(c, s2), "both prompt");
+        }),
+
+        ("a hook's write lands while the widget reads the file", () =>
+        {
+            e.StartWidget();
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s); e.SetOn(T(s, a));
+            e.Until(() => e.On(T(s, a)), "on");
+            // Hold the .meta open the way the widget reads it (ten times a second) while the hook
+            // replaces it: until the hook's temp file shows it's waiting, then a moment more.
+            var fs = new FileStream(e.Meta(T(s, a)), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var holder = Task.Run(() =>
+            {
+                using var _ = fs;
+                var sw = Stopwatch.StartNew();
+                while (Directory.GetFiles(e.Sessions, "*.meta.*.tmp").Length == 0 && sw.ElapsedMilliseconds < 3000) Thread.Sleep(2);
+                Thread.Sleep(40);
+            });
+            e.Expect(e.Tool(a, s), "approved");
+            holder.Wait();
+            e.Until(() => e.Tile(T(s, a))?.Count == 1, "the approval counted");
         }),
 
         ("upgrade from bare ids: tile keeps its slot and tally", () =>
@@ -450,14 +583,16 @@ sealed class Env
         // Inherited by the widget, the fake Claudes and every hook they run.
         Environment.SetEnvironmentVariable("HOOKER_TEST_HOME", Home);
         Environment.SetEnvironmentVariable("HOOKER_TEST_HIDDEN", "1");
+        Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", null);   // nothing may point anywhere real
     }
 
     public void Reset()
     {
         Teardown();
-        for (int i = 0; ; i++)
-            try { if (Directory.Exists(Home)) Directory.Delete(Home, true); break; }
-            catch when (i < 20) { Thread.Sleep(100); }
+        foreach (var dir in new[] { Home, Payloads })
+            for (int i = 0; ; i++)
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); break; }
+                catch when (i < 20) { Thread.Sleep(100); }
         Directory.CreateDirectory(Registry);
         Directory.CreateDirectory(Payloads);
     }
@@ -473,7 +608,11 @@ sealed class Env
     {
         try { File.Delete(Path.Combine(Home, "tiles.now")); } catch { }
         _widget = Process.Start(new ProcessStartInfo(Widget) { UseShellExecute = false })!;
-        Until(() => File.Exists(Path.Combine(Home, "tiles.now")), "widget running", 10000);
+        _lastTick = -1;
+        Until(() => _widget.HasExited || File.Exists(Path.Combine(Home, "tiles.now")), "widget running", 10000);
+        // Exiting at once = another test widget holds the test mutex (a leftover run's).
+        if (_widget.HasExited) throw new Exception("the test widget exited at once - is another test widget running?");
+        Tiles();   // and the tiles are this widget's
     }
 
     public void KillWidget()
@@ -501,7 +640,21 @@ sealed class Env
     public void Start(Fake f, string sid, string source = "startup") { f.Register(sid); f.Hook("SessionStart", sid, source: source); }
     // Claude's own order on exit: its registry entry is already gone when SessionEnd fires.
     public void Close(Fake f, string sid) { f.Unregister(); f.Hook("SessionEnd", sid); f.Exit(); }
-    public bool Tool(Fake f, string sid) => f.Hook("PreToolUse", sid, tool: "Bash").Contains("\"allow\"");
+    // Whether a tool call was auto-approved: no output (Claude asks you) or exactly an allow decision.
+    public bool Tool(Fake f, string sid)
+    {
+        var o = f.Hook("PreToolUse", sid, tool: "Bash");
+        if (o.Length == 0) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(o);
+            var h = doc.RootElement.GetProperty("hookSpecificOutput");
+            if (h.GetProperty("hookEventName").GetString() == "PreToolUse"
+                && h.GetProperty("permissionDecision").GetString() == "allow") return true;
+        }
+        catch { }
+        throw new Exception("hook.exe printed something other than an allow decision: " + o);
+    }
     // What the widget writes when you click a tile on (it honours .state on its next tick).
     public void SetOn(string tile) { Directory.CreateDirectory(Sessions); File.WriteAllText(State(tile), "on"); }
     // A real click on the tile / its Dismiss, through the test build's command file.
@@ -540,29 +693,47 @@ sealed class Env
         catch { return new(); }
     }
 
-    // The tiles the widget shows, left to right (written by its test probe every tick).
+    // The tiles the widget shows, left to right (written by its test probe every tick, under a
+    // "#<pid> <tick>" header). Throws unless they come from the widget this scenario started and
+    // it's still updating them, so a crashed or frozen widget can't pass a "stays off" check.
+    long _lastTick = -1;
+    readonly Stopwatch _sinceTick = Stopwatch.StartNew();
     public List<Tile> Tiles()
     {
-        for (int i = 0; i < 10; i++)
+        string[]? lines = null;
+        for (int i = 0; i < 20 && lines == null; i++)
+            try { lines = File.ReadAllLines(Path.Combine(Home, "tiles.now")); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Thread.Sleep(20); }
+        if (lines == null || lines.Length == 0 || !lines[0].StartsWith('#')) throw new Exception("can't read the test widget's tiles");
+        var h = lines[0][1..].Split(' ');
+        if (_widget == null || int.Parse(h[0]) != _widget.Id) throw new Exception($"tiles come from another widget (pid {h[0]})");
+        long tick = long.Parse(h[1]);
+        if (tick != _lastTick) { _lastTick = tick; _sinceTick.Restart(); }
+        else if (_sinceTick.ElapsedMilliseconds > 2000) throw new Exception("the test widget stopped updating its tiles");
+        var tiles = new List<Tile>();
+        foreach (var line in lines.Skip(1))
         {
-            try
-            {
-                var tiles = new List<Tile>();
-                foreach (var line in File.ReadAllLines(Path.Combine(Home, "tiles.now")))
-                {
-                    var p = line.Split(' ');
-                    if (p.Length == 4) tiles.Add(new Tile(p[0], p[1] == "on", p[2] == "working", long.Parse(p[3])));
-                }
-                return tiles;
-            }
-            catch (IOException) { Thread.Sleep(20); }
+            var p = line.Split(' ');
+            if (p.Length == 4) tiles.Add(new Tile(p[0], p[1] == "on", p[2] == "working", long.Parse(p[3])));
         }
-        return new();
+        return tiles;
     }
     public Tile? Tile(string id) => Tiles().FirstOrDefault(t => t.Id == id);
     public bool Has(string id) => Tile(id) != null;
     public bool On(string id) => Tile(id)?.On == true;
-    public string Describe() { var t = Tiles(); return t.Count == 0 ? "(none)" : string.Join("  ", t.Select(x => $"{x.Id}[{(x.On ? "on" : "off")},{(x.Working ? "working" : "waiting")},{x.Count}]")); }
+    public string Describe()
+    {
+        try { var t = Tiles(); return t.Count == 0 ? "(none)" : string.Join("  ", t.Select(x => $"{x.Id}[{(x.On ? "on" : "off")},{(x.Working ? "working" : "waiting")},{x.Count}]")); }
+        catch (Exception ex) { return "(" + ex.Message + ")"; }
+    }
+
+    // Wait until the widget has synced n more times (e.g. so it has surely read a torn file).
+    public void WaitTicks(int n)
+    {
+        Tiles();
+        long from = _lastTick;
+        Until(() => { Tiles(); return _lastTick >= from + n; }, $"{n} widget ticks");
+    }
 
     public void Expect(bool ok, string what) { if (!ok) throw new Exception("expected: " + what); }
 
@@ -645,13 +816,21 @@ sealed class Fake
         return reply;
     }
 
-    // Runs hook.exe for one event and returns what it printed on stdout.
+    // Runs hook.exe for one event and returns what it printed on stdout. It must exit 0, and print
+    // nothing for anything but PreToolUse (Claude would take that output as context or an error).
     public string Hook(string evt, string sid, string? source = null, string? tool = null)
     {
         var payload = Payload(evt, sid, source, tool);
         var outFile = payload + ".out";
-        Send($"hook\t{_env.Hook}\t{payload}\t{outFile}");
-        return File.ReadAllText(outFile);
+        ExpectExit0(Send($"hook\t{_env.Hook}\t{payload}\t{outFile}"), evt);
+        var o = File.ReadAllText(outFile);
+        if (evt != "PreToolUse" && o.Length > 0) throw new Exception($"hook.exe printed on {evt}: {o}");
+        return o;
+    }
+
+    static void ExpectExit0(string reply, string what)
+    {
+        if (reply != "ok 0") throw new Exception($"hook.exe ({what}) exited with {reply[2..].Trim()}");
     }
 
     // Same, but while the hook runs, the registry also holds a dead Claude's entry under the
@@ -660,7 +839,7 @@ sealed class Fake
     {
         var payload = Payload(evt, sid, null, "Bash");
         var outFile = payload + ".out";
-        Send($"hook-stale\t{_env.Hook}\t{payload}\t{outFile}\t{_env.Registry}\t{staleSid}");
+        ExpectExit0(Send($"hook-stale\t{_env.Hook}\t{payload}\t{outFile}\t{_env.Registry}\t{staleSid}"), evt);
         return File.ReadAllText(outFile);
     }
 
@@ -699,7 +878,8 @@ static class FakeClaudeMode
                         var runs = Enumerable.Range(0, int.Parse(p[4]))
                             .Select(i => Task.Run(() => Shell(p[1], p[2], p[3] + "." + i, null, null))).ToArray();
                         Task.WaitAll(runs);
-                        Console.WriteLine("ok");
+                        var bad = runs.Select(r => r.Result).FirstOrDefault(r => r != "ok 0");
+                        Console.WriteLine(bad == null ? "ok" : "err a parallel hook: " + bad);
                         break;
                     case "exit": return 0;
                     default: Console.WriteLine("err unknown command " + p[0]); break;
@@ -723,8 +903,10 @@ static class FakeClaudeMode
             stale = Path.Combine(registry!, pr.Id + ".json");
             File.WriteAllText(stale, JsonSerializer.Serialize(new { pid = pr.Id, sessionId = staleSid, status = "idle" }));
         }
-        pr.WaitForExit();
+        // A hung hook would hang Claude: fail the scenario instead of the whole run.
+        bool done = pr.WaitForExit(15000);
+        if (!done) try { pr.Kill(true); } catch { }
         if (stale != null) try { File.Delete(stale); } catch { }
-        return "ok " + pr.ExitCode;
+        return done ? "ok " + pr.ExitCode : "err hook.exe still running after 15 s";
     }
 }

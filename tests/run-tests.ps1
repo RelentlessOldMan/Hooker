@@ -43,13 +43,21 @@ function New-TestSrc($dir) {
     # Hidden (no window pops up); after every sync, report the tiles and take any test clicks.
     Edit-Src $dir 'tray\Program.cs' "bool ShouldHideForFullscreen()`n    {" "bool ShouldHideForFullscreen()`n    {`n        if (Environment.GetEnvironmentVariable(`"HOOKER_TEST_HIDDEN`") == `"1`") return true;"
     Edit-Src $dir 'tray\Program.cs' "            SyncSessions();`n`n            // Poll the display topology" "            SyncSessions(); TestProbe.Dump(_order, _sessions); TestProbe.Run(ToggleSession, DismissSession);`n`n            // Poll the display topology"
+    # Nothing in the test copies may still reach the real profile, Claude config or widget.
+    foreach ($f in Get-ChildItem $dir -Recurse -Filter *.cs) {
+        $hit = Select-String -Path $f.FullName -Pattern 'UserProfile|USERPROFILE|HOMEPATH|HOMEDRIVE|CLAUDE_CONFIG_DIR|Hooker\.Widget\.SingleInstance' |
+            Where-Object { -not $_.Line.TrimStart().StartsWith('//') } | Select-Object -First 1
+        if ($hit) { throw "test copy still reaches the real profile/widget: $($f.Name):$($hit.LineNumber): $($hit.Line.Trim()) - update run-tests.ps1" }
+    }
     Add-Content (Join-Path $dir 'tray\Program.cs') @'
 
-// Test build only (added by tests\run-tests.ps1). Dump: the tiles shown, left to right, one per
-// line: "<tile> on|off working|waiting <count>". Run: clicks asked for in cmd.txt, one per line:
-// "toggle <tile>" (left-click) or "dismiss <tile>".
+// Test build only (added by tests\run-tests.ps1). Dump: a header "#<widget pid> <tick>", then the
+// tiles shown, left to right, one per line: "<tile> on|off working|waiting <count>". Run: clicks
+// asked for in cmd.txt, one per line: "toggle <tile>" (left-click) or "dismiss <tile>".
 static class TestProbe
 {
+    static long _ticks;
+
     public static void Run(Action<string> toggle, Action<string> dismiss)
     {
         try
@@ -73,6 +81,7 @@ static class TestProbe
         try
         {
             var sb = new System.Text.StringBuilder();
+            sb.Append('#').Append(Environment.ProcessId).Append(' ').Append(++_ticks).Append('\n');
             foreach (var t in order)
             {
                 sessions.TryGetValue(t, out var s);
@@ -100,6 +109,23 @@ function Run-Harness($bin, $filter) {
     & (Join-Path $work 'harness\HookerTests.exe') @a
 }
 
+# Test processes (widget, fake Claudes, hooks) left running by an interrupted run: a leftover
+# test widget holds the test mutex, so the next run's scenarios would quietly test IT. Matched by
+# path under the work folder only - never the installed widget.
+function Stop-TestProcesses {
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { try { $_.Path -and $_.Path.StartsWith($work + '\', [StringComparison]::OrdinalIgnoreCase) } catch { $false } } |
+        ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) | Out-Null } catch { } }
+}
+
+# One run at a time: two would share the work folder and the test mutex.
+New-Item -ItemType Directory -Force $work | Out-Null
+try { $lock = [IO.File]::Open((Join-Path $work 'run.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+catch { throw "another test run is in progress (it holds $work\run.lock)" }
+
+$code = 1
+try {
+Stop-TestProcesses
 $src = Join-Path $work 'src'
 $bin = Join-Path $work 'bin'
 New-TestSrc $src
@@ -110,8 +136,9 @@ Build (Join-Path $PSScriptRoot 'Harness\Harness.csproj') (Join-Path $work 'harne
 
 if (-not $SelfCheck) {
     Run-Harness $bin $Filter
-    exit $LASTEXITCODE
+    $code = $LASTEXITCODE
 }
+else {
 
 # Each past bug, put back: file, the fixed code, the buggy code, and the scenario that must fail.
 $bugs = @(
@@ -140,31 +167,64 @@ $bugs = @(
        Find = 'pre.Status.Length == 0) continue;'; Bug = 'pre.Status.Length < 0) continue;'
        Scenario = 'picker' },
     @{ Name = 'killed Claude keeps its tile (06faeda)'; File = 'tray\Program.cs'
-       Find = 'if (pid > 0 && !ProcessAlive(pid, pidSeen)) continue;'; Bug = ''
+       Find = 'if (!ProcessAlive(pid, pidSeen)) { deadAt[pid] = written; continue; }'; Bug = ''
        Scenario = 'killed Claude' },
-    @{ Name = 'sessions sharing a process seen as /clear swaps (68e8f83: both its guards)'; File = 'tray\Program.cs'
-       Find = 'if (procCount[proc] > 1) continue;'; Bug = ''
+    @{ Name = 'sessions sharing a process seen as /clear swaps every tick (68e8f83)'; File = 'tray\Program.cs'
+       Find = 'var key = (kv.Value.File, kv.Value.ProcStart);'; Bug = 'var key = (kv.Value.Pid.ToString(), kv.Value.ProcStart);'
        Find2 = "`n                && !reg.ContainsKey(old))"; Bug2 = ')'
        Scenario = 'several sessions in one' },
+    @{ Name = 'sessions sharing a process swapped by torn reads (v1.0.34: tracked by process)'; File = 'tray\Program.cs'
+       Find = 'var key = (kv.Value.File, kv.Value.ProcStart);'; Bug = 'var key = (kv.Value.Pid.ToString(), kv.Value.ProcStart);'
+       Scenario = 'sharing a process' },
     @{ Name = 'widget start doesn''t wipe switches (08dcbfb)'; File = 'tray\Program.cs'
        Find = "internal static void WipeStates()`n    {"; Bug = "internal static void WipeStates()`n    {`n        return;"
        Scenario = "widget isn't running" },
     @{ Name = '/clear drops autopilot (3f1a72e)'; File = 'tray\Program.cs'
        Find = 'if (fresh && start == "clear" && sw.WasOn && st == null)'; Bug = 'if (false && fresh && start == "clear" && sw.WasOn && st == null)'
        Scenario = '/clear keeps the tile' },
-    @{ Name = 'a torn registry read forgets the process before /clear'; File = 'tray\Program.cs'
-       Find = 'if (n >= RegMissesToPrune) { _procSid.Remove(proc);'; Bug = 'if (n >= 1) { _procSid.Remove(proc);'
+    @{ Name = 'a torn registry read forgets the window before /clear'; File = 'tray\Program.cs'
+       Find = 'if (n >= RegMissesToPrune) { _fileSid.Remove(key);'; Bug = 'if (n >= 1) { _fileSid.Remove(key);'
        Scenario = 'tore just before' },
     @{ Name = 'Remember restores per conversation, not per window'; File = 'tray\Program.cs'
-       Find = 'bool restore = _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);'; Bug = 'bool restore = _remembered.ContainsKey(SidOf(sid));'
+       Find = "bool restore = _userSet.TryGetValue(sid, out var mine) ? mine`n                         : _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);"
+       Bug = 'bool restore = _remembered.ContainsKey(SidOf(sid));'
        Scenario = 'each window gets its own' },
+    @{ Name = 'Remember overrides a click in a new window''s first seconds (v1.0.34)'; File = 'tray\Program.cs'
+       Find = '_userSet.TryGetValue(sid, out var mine) ? mine'; Bug = '_userSet.TryGetValue(sid, out var mine) && false ? mine'
+       Scenario = 'first seconds' },
     @{ Name = 'saved on-windows count as on without Remember'; File = 'tray\Program.cs'
        Find = '                        foreach (var sid in c.OnTiles ?? new List<string>())'; Bug = "                        }`n                        {`n                        foreach (var sid in c.OnTiles ?? new List<string>())"
        Scenario = 'without Remember' },
     @{ Name = 'no miss budget: one torn read evicts a tile'; File = 'tray\Program.cs'
        Find = 'const int RegMissesToPrune = 15;'; Bug = 'const int RegMissesToPrune = 1;'
-       Scenario = 'tore just before' }
+       Scenario = 'tore just before' },
+    @{ Name = 'an unreadable registry evicts every tile'; File = 'tray\Program.cs'
+       Find = 'usable = files.Length == 0 || parsed > 0;'; Bug = 'usable = true;'
+       Scenario = 'unreadable' },
+    @{ Name = 'dismissals forgotten on a widget restart'; File = 'tray\Program.cs'
+       Find = 'SafeTileId(sid)) _dismissed.Add(sid);'; Bug = 'SafeTileId(sid)) { }'
+       Scenario = 'dismissed window' },
+    @{ Name = 'hook write lost while the widget reads the file (v1.0.34)'; File = 'shim\Program.cs'
+       Find = 'catch (Exception e) when ((e is IOException or UnauthorizedAccessException) && i < 20)'; Bug = 'catch (Exception e) when ((e is IOException or UnauthorizedAccessException) && i < 0)'
+       Scenario = 'while the widget reads' },
+    @{ Name = 'auto-compact switches autopilot off'; File = 'shim\Program.cs'
+       Find = 'bool fresh = source is not ("clear" or "compact");'; Bug = 'bool fresh = source is not "clear";'
+       Scenario = 'compact' },
+    @{ Name = 'AskUserQuestion auto-answered on autopilot'; File = 'shim\Program.cs'
+       Find = 'if (tool == "AskUserQuestion") { SetStatus("waiting"); break; }'; Bug = 'if (false) { SetStatus("waiting"); break; }'
+       Scenario = 'AskUserQuestion' },
+    @{ Name = 'hook exits non-zero'; File = 'shim\Program.cs'
+       Find = "return 0;`n`n// Which Claude process"; Bug = "return 1;`n`n// Which Claude process"
+       Scenario = 'fresh session' }
 )
+
+# Baseline: every scenario a bug points at must PASS on the real code first - one that already
+# fails would make every mutation look "caught".
+foreach ($s in ($bugs | ForEach-Object { $_.Scenario } | Select-Object -Unique)) {
+    $out = Run-Harness $bin $s
+    if ($LASTEXITCODE -ne 0) { $out | Write-Host; throw "baseline: scenario '$s' doesn't pass on the unchanged code (exit $LASTEXITCODE)" }
+}
+Write-Host "baseline: every targeted scenario passes on the unchanged code`n"
 
 $missed = 0
 foreach ($b in $bugs) {
@@ -179,8 +239,19 @@ foreach ($b in $bugs) {
     $proj = if ($b.File -like 'shim*') { 'shim\Shim.csproj' } else { 'tray\Tray.csproj' }
     Build (Join-Path $mdir $proj) (Join-Path $mbin (Split-Path $proj -Parent))
     $out = Run-Harness $mbin $b.Scenario
-    if ($LASTEXITCODE -ne 0) { Write-Host "caught   $($b.Name)" }
-    else { $missed++; Write-Host "MISSED   $($b.Name)"; $out | Write-Host }
+    # 1 = a scenario failed (caught); 0 = all passed (missed); anything else (3 = no scenario
+    # matched, 2 = bad arguments) is a broken self-check, not a result.
+    if ($LASTEXITCODE -eq 1) { Write-Host "caught   $($b.Name)" }
+    elseif ($LASTEXITCODE -eq 0) { $missed++; Write-Host "MISSED   $($b.Name)"; $out | Write-Host }
+    else { $out | Write-Host; throw "self-check broken for '$($b.Name)' (harness exit $LASTEXITCODE)" }
+    Stop-TestProcesses
 }
 Write-Host "`n$($bugs.Count - $missed)/$($bugs.Count) old bugs caught"
-exit $(if ($missed -eq 0) { 0 } else { 1 })
+$code = if ($missed -eq 0) { 0 } else { 1 }
+}
+}
+finally {
+    Stop-TestProcesses
+    $lock.Dispose()
+}
+exit $code
