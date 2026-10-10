@@ -14,7 +14,8 @@
 // A tile is one running session: "<sid>@<pid>", the session id plus its Claude process. Two
 // windows that resume the same conversation share a session id but are two sessions, so they
 // get two tiles, each with its own autopilot. (Just "<sid>" when there's no registry to say
-// which process.) Remember autopilot is per conversation, by session id.
+// which process.) Remember autopilot gives each window back its own setting; a window opened
+// since (a resume) gets its conversation's.
 //
 // System meter (toggle in the right-click menu): the left-most "two tiles" are live vertical
 // bars (no labels) of Task Manager's Performance numbers - CPU, Memory, Network, GPU - with detail
@@ -160,9 +161,11 @@ sealed class WidgetForm : Form
     readonly HashSet<string> _lastOn = new(StringComparer.OrdinalIgnoreCase);     // tiles whose switch was last seen "on" (persisted)
     readonly HashSet<string> _knownTiles = new(StringComparer.OrdinalIgnoreCase); // tiles that were already up when the widget started
     readonly HashSet<string> _rememberedAtStart = new(StringComparer.OrdinalIgnoreCase);   // new tiles whose conversation was remembered as they appeared
-    readonly Dictionary<(long Pid, long ProcStart), string> _procSid = new();     // live Claude process -> its current tile
-    readonly Dictionary<(long Pid, long ProcStart), int> _procMiss = new();       // consecutive ticks a tracked process went unlisted
+    readonly Dictionary<string, bool> _userSet = new(StringComparer.OrdinalIgnoreCase);   // tiles you clicked or dismissed this run -> on? (Remember keeps that)
+    readonly Dictionary<(string File, long ProcStart), string> _fileSid = new();  // registry entry -> the tile it lists
+    readonly Dictionary<(string File, long ProcStart), int> _fileMiss = new();    // consecutive ticks a tracked entry went unread
     readonly Dictionary<long, (string Name, long Created)> _pidSeen = new();       // what each registered pid was when first seen
+    readonly Dictionary<long, long> _deadAt = new();                               // pid seen dead -> its entry's last write then
     readonly Dictionary<string, (long At, bool WasOn)> _swapped = new(StringComparer.OrdinalIgnoreCase);   // new tile <- same process swapped ids
     readonly Dictionary<string, long> _tileSince = new(StringComparer.OrdinalIgnoreCase);   // when each tile appeared (Remember restores only then)
     int _stateSweep;                                                              // throttles the stale-.state sweep
@@ -373,6 +376,7 @@ sealed class WidgetForm : Form
     void DismissSession(string sid)
     {
         _dismissed.Add(sid);   // the session is still live, so without this the tile returns next tick
+        _userSet[sid] = false; // and when it does, it's manual: Remember mustn't switch it back on
         DeleteSessionFiles(sid);
         _lastOn.Remove(sid);
         ForgetUnlessOn(sid);       // hiding a tile ends its autopilot for good - it comes back manual
@@ -684,9 +688,10 @@ sealed class WidgetForm : Form
 
     // ---- data sync -------------------------------------------------------
 
-    // Read allowing a concurrent writer (the shim renames .meta and we write .state): a plain
-    // File.ReadAllText denies writers, which would block the shim's atomic rename and drop the
-    // update. Returns null on any failure (missing/locked/torn) so callers keep prior state.
+    // Read allowing a concurrent writer (the shim renames .meta and we write .state) as far as
+    // Windows allows: a rename over a file still fails while it's open, so writers retry, and
+    // the handle is held only for the read. Returns null on any failure (missing/locked/torn)
+    // so callers keep prior state.
     static string? ReadShared(string path)
     {
         try
@@ -700,13 +705,24 @@ sealed class WidgetForm : Form
 
     // Write-then-rename so a concurrent shim never reads a half-written .state (which drives
     // auto-approve). Per-process temp name so parallel writers can't clobber each other's tmp.
+    // Flushed to disk first, so a power cut can't leave widget.json empty (which would cost every
+    // setting). Windows refuses to rename over a file anyone has open - a hook reading this
+    // .state, however it shares it - so retry briefly rather than drop the write.
     static void WriteAtomic(string path, string content)
     {
         var tmp = path + "." + Environment.ProcessId + ".tmp";
         try
         {
-            File.WriteAllText(tmp, content);
-            File.Move(tmp, path, overwrite: true);
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(System.Text.Encoding.UTF8.GetBytes(content));
+                fs.Flush(true);
+            }
+            for (int i = 0; ; i++)
+            {
+                try { File.Move(tmp, path, overwrite: true); break; }
+                catch (Exception e) when ((e is IOException or UnauthorizedAccessException) && i < 20) { Thread.Sleep(10); }
+            }
         }
         finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
     }
@@ -721,7 +737,7 @@ sealed class WidgetForm : Form
         // Unusable = no registry folder, or entries present but none readable (format change, or every
         // file mid-write): don't prune blind. An empty-but-present folder is usable: no live sessions,
         // so the last tile goes away too.
-        var reg = LoadRegistry(_pidSeen, out bool regUsable);
+        var reg = LoadRegistry(_pidSeen, _deadAt, out bool regUsable);
         foreach (var sid in reg.Keys) _seenInReg.Add(sid);
 
         // Each listed session id's tiles. A tile named by the bare id is one the hook couldn't
@@ -735,40 +751,32 @@ sealed class WidgetForm : Form
         }
         AdoptBareIds(bySid);
 
-        // /clear (and an in-place /resume) gives the SAME Claude process a new session id, and the
-        // old id's SessionEnd deletes its switch. Spot it by process, so the tile keeps its slot.
-        // Only a process hosting exactly ONE session can be tracked this way: an IDE extension or
-        // the desktop app runs several sessions in one process, and pairing those up would see
-        // a "swap" between sibling sessions on every tick and evict them. And the old id must
-        // really have left the registry - a session still listed was not replaced.
-        var procCount = new Dictionary<(long, long), int>();
-        foreach (var kv in reg)
-            if (kv.Value.Pid > 0)
-            {
-                var proc = (kv.Value.Pid, kv.Value.ProcStart);
-                procCount[proc] = procCount.TryGetValue(proc, out var n) ? n + 1 : 1;
-            }
-        var procs = new HashSet<(long, long)>();
+        // /clear (and an in-place /resume) gives the same window a new session id, and the old
+        // id's SessionEnd deletes its switch. Claude rewrites that window's own registry entry
+        // with the new id, so spot it by entry, and the tile keeps its slot. By entry, not by
+        // process: an IDE extension or the desktop app runs several sessions in one process, each
+        // with its own entry, so a torn read hiding one of them can never pass the other off as
+        // its successor. And the old id must really have left the registry.
+        var entries = new HashSet<(string, long)>();
         foreach (var kv in reg)
         {
             if (kv.Value.Pid <= 0) continue;
-            var proc = (kv.Value.Pid, kv.Value.ProcStart);
-            if (procCount[proc] > 1) continue;   // shared process: not tracked (dropped below)
-            procs.Add(proc);
-            if (_procSid.TryGetValue(proc, out var old) && !old.Equals(kv.Key, StringComparison.OrdinalIgnoreCase)
+            var key = (kv.Value.File, kv.Value.ProcStart);
+            entries.Add(key);
+            if (_fileSid.TryGetValue(key, out var old) && !old.Equals(kv.Key, StringComparison.OrdinalIgnoreCase)
                 && !reg.ContainsKey(old))
                 SessionSwapped(old, kv.Key);
-            _procSid[proc] = kv.Key;
+            _fileSid[key] = kv.Key;
         }
-        // Forget a process only after the same miss budget as a tile: one torn read of its entry
-        // (Claude rewriting it - as /clear does) mustn't lose the swap that's about to show.
+        // Forget an entry only after the same miss budget as a tile: one torn read of it (Claude
+        // rewriting it - as /clear does) mustn't lose the swap that's about to show.
         if (regUsable)
-            foreach (var proc in new List<(long Pid, long ProcStart)>(_procSid.Keys))
+            foreach (var key in new List<(string File, long ProcStart)>(_fileSid.Keys))
             {
-                if (procs.Contains(proc)) { _procMiss.Remove(proc); continue; }
-                int n = _procMiss.TryGetValue(proc, out var c) ? c + 1 : 1;
-                if (n >= RegMissesToPrune) { _procSid.Remove(proc); _procMiss.Remove(proc); }
-                else _procMiss[proc] = n;
+                if (entries.Contains(key)) { _fileMiss.Remove(key); continue; }
+                int n = _fileMiss.TryGetValue(key, out var c) ? c + 1 : 1;
+                if (n >= RegMissesToPrune) { _fileSid.Remove(key); _fileMiss.Remove(key); }
+                else _fileMiss[key] = n;
             }
         foreach (var kv in new List<KeyValuePair<string, (long At, bool WasOn)>>(_swapped))
             if (NowMs() - kv.Value.At > 10_000) _swapped.Remove(kv.Key);   // its new id never showed
@@ -810,6 +818,7 @@ sealed class WidgetForm : Form
                     _dismissed.Remove(sid);
                     _lastOn.Remove(sid);
                     _tileSince.Remove(sid);
+                    _userSet.Remove(sid);
                     DeleteSessionFiles(sid);
                     continue;
                 }
@@ -877,8 +886,10 @@ sealed class WidgetForm : Form
             // back what you chose. A window that was already up when the widget started: exactly its
             // own last setting, so one you left manual stays manual beside one that's on. A window
             // new since (a resume): its conversation's, if that was remembered before it appeared -
-            // switching one window on mustn't drag along others that just opened.
-            bool restore = _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);
+            // switching one window on mustn't drag along others that just opened. And one you've
+            // clicked or dismissed since gets exactly what you chose, even if its SessionStart wiped it.
+            bool restore = _userSet.TryGetValue(sid, out var mine) ? mine
+                         : _knownTiles.Contains(sid) ? _lastOn.Contains(sid) : _rememberedAtStart.Contains(sid);
             if (st == null && _remember && restore && NowMs() - _tileSince[sid] < RestoreWindowMs)
             {
                 try { WriteAtomic(statePath, "on"); st = "on"; _remembered[SidOf(sid)] = NowMs(); _configDirty = true; } catch { }
@@ -954,6 +965,7 @@ sealed class WidgetForm : Form
         }
         _sessions.Remove(old);
         _tileSince.Remove(old);
+        _userSet.Remove(old);
         _regMiss.Remove(old);
         if (_dismissed.Remove(old)) _configDirty = true;
         DeleteSessionFiles(old);   // it has ended (its SessionEnd does the same); no lingering tile
@@ -963,7 +975,8 @@ sealed class WidgetForm : Form
     // session id -> what Claude knows about it. This is both our liveness signal and (since a
     // live session may have no .meta yet) the list of tiles to show. Undocumented/internal, so
     // best-effort - any failure just drops that entry and we fall back to folder + hook signal.
-    static Dictionary<string, RegInfo> LoadRegistry(Dictionary<long, (string Name, long Created)> pidSeen, out bool usable)
+    static Dictionary<string, RegInfo> LoadRegistry(Dictionary<long, (string Name, long Created)> pidSeen,
+                                                    Dictionary<long, long> deadAt, out bool usable)
     {
         var map = new Dictionary<string, RegInfo>(StringComparer.OrdinalIgnoreCase);
         usable = false;
@@ -994,22 +1007,40 @@ sealed class WidgetForm : Form
                     long pid = r.TryGetProperty("pid", out var pe) && pe.TryGetInt64(out var pv) ? pv : 0;
                     long procStart = r.TryGetProperty("procStart", out var ps) && ps.ValueKind == JsonValueKind.String
                                      && long.TryParse(ps.GetString(), out var pst) ? pst : 0;
-                    if (pid > 0) pids.Add(pid);
-                    if (pid > 0 && !ProcessAlive(pid, pidSeen)) continue;
+                    if (pid > 0)
+                    {
+                        pids.Add(pid);
+                        // Once seen dead, an entry stays dead for as long as it's left unchanged -
+                        // whatever process Windows hands its pid to next (a hook's shell, git...),
+                        // which would otherwise bring the dead tile back. Rewritten means a new
+                        // Claude got that pid: judge it afresh.
+                        long written;
+                        try { written = File.GetLastWriteTimeUtc(f).Ticks; } catch { written = 0; }
+                        if (deadAt.TryGetValue(pid, out var was))
+                        {
+                            if (written == 0 || written == was) continue;
+                            deadAt.Remove(pid); pidSeen.Remove(pid);
+                        }
+                        if (!ProcessAlive(pid, pidSeen)) { deadAt[pid] = written; continue; }
+                    }
                     var name = r.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
                     var status = r.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
                     var cwd = r.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
                     long started = r.TryGetProperty("startedAt", out var t)
                                    && t.ValueKind == JsonValueKind.Number && t.TryGetInt64(out var ms) ? ms : 0;
                     // Keyed by tile: the same conversation open in two windows is two sessions.
-                    map[pid > 0 ? sid + "@" + pid : sid] = new RegInfo(sid, name, status, cwd, started, pid, procStart);
+                    map[pid > 0 ? sid + "@" + pid : sid] = new RegInfo(sid, name, status, cwd, started, pid, procStart, Path.GetFileName(f));
                 }
                 catch { }
             }
             usable = files.Length == 0 || parsed > 0;   // all-dead is still a readable registry
             if (usable)
+            {
                 foreach (var pid in new List<long>(pidSeen.Keys))
                     if (!pids.Contains(pid)) pidSeen.Remove(pid);
+                foreach (var pid in new List<long>(deadAt.Keys))
+                    if (!pids.Contains(pid)) deadAt.Remove(pid);
+            }
         }
         catch { }
         return map;
@@ -1129,7 +1160,7 @@ sealed class WidgetForm : Form
     }
 
     // What we keep from one registry entry.
-    readonly record struct RegInfo(string Sid, string Name, string Status, string Cwd, long StartedAt, long Pid, long ProcStart);
+    readonly record struct RegInfo(string Sid, string Name, string Status, string Cwd, long StartedAt, long Pid, long ProcStart, string File);
 
     // Lowercase keys mirror the .meta JSON the shim writes.
     sealed class MetaDto
@@ -1427,6 +1458,7 @@ sealed class WidgetForm : Form
             Invalidate();
             return;
         }
+        _userSet[sid] = s.Hooking;   // your call from here on: Remember never overrides it
         if (_remember)
         {
             if (s.Hooking) _remembered[SidOf(sid)] = NowMs(); else ForgetUnlessOn(sid);

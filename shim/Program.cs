@@ -76,8 +76,8 @@ try
     {
         try
         {
-            // FileShare.Delete too, so a concurrent rename-over (File.Move overwrite) of this file
-            // by the widget or another shim isn't blocked by our open handle.
+            // FileShare.Delete too, though Windows still refuses a rename over a file that's open:
+            // writers retry for that (see WriteMeta), so keep the handle brief.
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
             return sr.ReadToEnd();
@@ -102,11 +102,18 @@ try
             // Write-then-rename so the widget never reads a half-written .meta. The temp name is
             // per-process so two shim invocations for the SAME session (Claude can fire tools in
             // parallel) can't write the same tmp and corrupt it; the finally clears a lost tmp.
+            // Windows refuses to rename over a file anyone has open - the widget reads every .meta
+            // ten times a second, however it shares it - so retry briefly rather than drop the
+            // write (losing a /clear's "start" would drop its autopilot).
             var tmp = metaPath + "." + Environment.ProcessId + ".tmp";
             try
             {
                 File.WriteAllText(tmp, JsonSerializer.Serialize(m));
-                File.Move(tmp, metaPath, overwrite: true);
+                for (int i = 0; ; i++)
+                {
+                    try { File.Move(tmp, metaPath, overwrite: true); break; }
+                    catch (Exception e) when ((e is IOException or UnauthorizedAccessException) && i < 20) { Thread.Sleep(10); }
+                }
             }
             finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
         }
