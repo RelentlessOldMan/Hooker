@@ -79,12 +79,13 @@ hooks  (hook.exe)         --writes--> ...\.claude\hooker\sessions\<sid>.meta    
                           <--read---  widget polls the .meta + Claude's session registry each 100ms
 ```
 
-`hook.exe` is registered on six Claude events, all per session:
+`hook.exe` is registered on seven Claude events, all per session:
 - `SessionStart` → new tile (waiting); on a new or resumed session also count reset + hooking off (compact keeps both; `/clear` is a new id the widget carries hooking over to)
 - `UserPromptSubmit` / `PreToolUse` → working (`PreToolUse` auto-approves + bumps the count when that session is hooking)
 - `AskUserQuestion` (a `PreToolUse`) → waiting (Claude needs you to pick)
 - `Stop`, `Notification` → waiting
 - `SessionEnd` → removes the session's files
+- `PostToolUse` → if [ClaudeWatch](https://github.com/RelentlessOldMan/ClaudeWatch) has written the week's usage to `~/.claude/claudewatch-usage.json`, tells the session `Weekly usage: 66% (resets Sat 10:00)` whenever the whole percentage changes, so a prompt like "work until the week hits 70%" can be followed. It only informs; without that file it does nothing
 
 The widget also reads Claude's internal per-session registry (`~/.claude/sessions/*.json`) for which sessions are live, their `/name` title and live busy status — **best-effort**: it's undocumented and may change between Claude versions, in which case tiles fall back to folder names + hook-based status (nothing breaks).
 

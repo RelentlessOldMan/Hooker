@@ -8,6 +8,10 @@
 //   2. Per-session status: translate lifecycle events into each session's .meta file
 //      (status working/waiting, cwd, auto-approval count) that the widget renders.
 //
+//   3. PostToolUse: tell the session the week's usage % (from ClaudeWatch's status line, if it's
+//      installed) whenever the whole number changes, so a prompt like "stop at 70%" can be
+//      followed. It only informs - it never decides or blocks anything.
+//
 // State lives under %USERPROFILE%\.claude\hooker\sessions\, one pair per tile:
 //   <tile>.meta   {"status","cwd","count","start","exe","created"}   (this shim writes; widget reads)
 //   <tile>.state  "on"/"off"                 (widget writes; this shim reads)
@@ -21,12 +25,11 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-var sessionsDir = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-    ".claude", "hooker", "sessions");
-var registryDir = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-    ".claude", "sessions");
+var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+var sessionsDir = Path.Combine(home, ".claude", "hooker", "sessions");
+var registryDir = Path.Combine(home, ".claude", "sessions");
+var usageFile = Path.Combine(home, ".claude", "claudewatch-usage.json");
+var usageSeenDir = Path.Combine(home, ".claude", "hooker", "usage");
 
 static string AllowJson() => JsonSerializer.Serialize(new
 {
@@ -64,6 +67,19 @@ try
     catch { /* no/invalid payload */ }
 
     if (sid.Length == 0) return 0; // nothing session-scoped to do
+    var usageSeen = Path.Combine(usageSeenDir, Sanitize(sid));
+
+    // Usage needs only the session id, so it skips the process walk below: it fires after every
+    // tool call and must cost next to nothing.
+    if (evt == "PostToolUse")
+    {
+        if (Usage.Line(usageFile, usageSeen) is string line)
+            Console.Out.Write(JsonSerializer.Serialize(new
+            {
+                hookSpecificOutput = new { hookEventName = "PostToolUse", additionalContext = line },
+            }));
+        return 0;
+    }
     long owner = Owner.Find(registryDir, sid);
     var tile = owner > 0 ? Sanitize(sid) + "@" + owner : Sanitize(sid);
 
@@ -184,6 +200,9 @@ try
             // carries autopilot over once it reads start == "clear" here.
             bool fresh = source is not ("clear" or "compact");
             if (fresh) { try { File.Delete(statePath); } catch { } }
+            // Whatever the session was told about usage is gone from its context now (a new or
+            // resumed window, or a compact), so tell it again on its next tool call.
+            try { File.Delete(usageSeen); } catch { }
             UpdateMeta(m =>
             {
                 m.status = "waiting";
@@ -215,6 +234,7 @@ try
         case "SessionEnd":
             try { File.Delete(metaPath); } catch { }
             try { File.Delete(statePath); } catch { }
+            try { File.Delete(usageSeen); } catch { }
             break;
     }
 }
@@ -339,6 +359,59 @@ static class Owner
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder name, ref int size);
+}
+
+// The week's usage, as ClaudeWatch's status line last saw it:
+//   {"sevenDay":{"usedPercentage":65,"resetsAt":<unix s>},"fiveHour":{...},"updatedAt":<unix s>}
+// The file may be missing, half-renamed or malformed on any machine - every such case is "no
+// data": silence. A line comes back only when the whole percentage differs from the last one this
+// session was told, and only once that's been noted, so an unwritable folder can't repeat it on
+// every tool call.
+static class Usage
+{
+    public static string? Line(string file, string seenPath)
+    {
+        try
+        {
+            if (Week(file) is not (double pct, long resets)) return null;
+            var whole = (long)Math.Round(pct, MidpointRounding.AwayFromZero);
+            string? seen = null;
+            try { seen = File.ReadAllText(seenPath).Trim(); } catch { }
+            if (seen == whole.ToString()) return null;
+            Directory.CreateDirectory(Path.GetDirectoryName(seenPath)!);
+            File.WriteAllText(seenPath, whole.ToString());
+            var line = $"Weekly usage: {whole}%";
+            if (resets > 0)
+                line += " (resets " + DateTimeOffset.FromUnixTimeSeconds(resets).ToLocalTime().ToString("ddd HH:mm") + ")";
+            return line;
+        }
+        catch { return null; }
+    }
+
+    // The week's percentage and reset time (0 = not given), or null when there's no current number:
+    // absent, not a number, or from a week that has already reset.
+    static (double, long)? Week(string file)
+    {
+        try
+        {
+            using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (fs.Length > 65536) return null;
+            using var doc = JsonDocument.Parse(fs);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object
+                || !root.TryGetProperty("sevenDay", out var week) || week.ValueKind != JsonValueKind.Object
+                || !week.TryGetProperty("usedPercentage", out var p) || p.ValueKind != JsonValueKind.Number
+                || !p.TryGetDouble(out var pct) || !double.IsFinite(pct) || pct < 0 || pct > 1000) return null;
+            long resets = 0;
+            if (week.TryGetProperty("resetsAt", out var r))
+            {
+                if (r.ValueKind != JsonValueKind.Number || !r.TryGetInt64(out resets) || resets <= 0 || resets > 253402300799) return null;
+                if (resets <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()) return null;   // stale: the week reset
+            }
+            return (pct, resets);
+        }
+        catch { return null; }
+    }
 }
 
 // Lowercase property names mirror the on-disk .meta JSON keys the widget reads.

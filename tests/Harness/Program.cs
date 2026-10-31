@@ -639,6 +639,63 @@ static class Scenarios
             e.Until(() => e.Tile(T(s, a))?.Working == true, "listed again: Claude's own busy status shows");
             e.Hold(() => e.Has(T(s, a)), 2000, "tile stays");
         }),
+        ("weekly usage reaches the session once per whole percent", () =>
+        {
+            var a = e.NewClaude(); var s = Sid();
+            var b = e.NewClaude(); var s2 = Sid();
+            e.Start(a, s); e.Start(b, s2);
+            var resets = DateTimeOffset.UtcNow.AddDays(2).ToUnixTimeSeconds();
+            var when = DateTimeOffset.FromUnixTimeSeconds(resets).ToLocalTime().ToString("ddd HH:mm");
+            e.WriteUsage(65, resets);
+            e.Expect(e.Usage(a, s) == $"Weekly usage: 65% (resets {when})", "told on its first tool call");
+            e.Expect(e.Usage(a, s) == "", "silent while it hasn't changed");
+            e.WriteUsage(65.4, resets);
+            e.Expect(e.Usage(a, s) == "", "silent while the whole number hasn't changed");
+            e.WriteUsage(65.5, resets);
+            e.Expect(e.Usage(a, s) == $"Weekly usage: 66% (resets {when})", "told when it moves");
+            e.Expect(e.Usage(b, s2) == $"Weekly usage: 66% (resets {when})", "each session keeps its own tally");
+            e.WriteUsageRaw("{\"sevenDay\":{\"usedPercentage\":70}}");
+            e.Expect(e.Usage(a, s) == "Weekly usage: 70%", "no reset time: just the number");
+        }),
+        ("weekly usage: a missing or bad file says nothing", () =>
+        {
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s);
+            e.Expect(e.Usage(a, s) == "", "no file");
+            foreach (var bad in new[]
+            {
+                "", "   ", "{", "null", "[]", "42", "{}", "{\"sevenDay\":null}", "{\"sevenDay\":65}",
+                "{\"fiveHour\":{\"usedPercentage\":12}}",
+                "{\"sevenDay\":{}}", "{\"sevenDay\":{\"usedPercentage\":\"65\"}}",
+                "{\"sevenDay\":{\"usedPercentage\":null}}", "{\"sevenDay\":{\"usedPercentage\":-3}}",
+                "{\"sevenDay\":{\"usedPercentage\":1e999}}",
+                "{\"sevenDay\":{\"usedPercentage\":65,\"resetsAt\":\"soon\"}}",
+                "{\"sevenDay\":{\"usedPercentage\":65,\"resetsAt\":1.5e300}}",
+                $"{{\"sevenDay\":{{\"usedPercentage\":65,\"resetsAt\":{DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeSeconds()}}}}}",
+                "\u0000\u00ff garbage",
+            })
+            {
+                e.WriteUsageRaw(bad);
+                e.Expect(e.Usage(a, s) == "", "silent on " + (bad.Length == 0 ? "an empty file" : bad));
+            }
+            e.WriteUsage(50, DateTimeOffset.UtcNow.AddDays(2).ToUnixTimeSeconds());
+            using (new FileStream(e.UsageFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                e.Expect(e.Usage(a, s) == "", "silent while the file is locked mid-rename");
+            e.Expect(e.Usage(a, s).StartsWith("Weekly usage: 50%"), "told once the file reads again");
+        }),
+        ("weekly usage is told again after a resume or compact", () =>
+        {
+            var a = e.NewClaude(); var s = Sid();
+            e.Start(a, s);
+            e.WriteUsage(40, DateTimeOffset.UtcNow.AddDays(2).ToUnixTimeSeconds());
+            e.Expect(e.Usage(a, s).StartsWith("Weekly usage: 40%"), "told");
+            e.Expect(e.Usage(a, s) == "", "then silent");
+            a.Hook("SessionStart", s, source: "compact");
+            e.Expect(e.Usage(a, s).StartsWith("Weekly usage: 40%"), "told again after a compact wiped its context");
+            var b = e.NewClaude();
+            e.Start(b, s, source: "resume");
+            e.Expect(e.Usage(b, s).StartsWith("Weekly usage: 40%"), "told again in a resumed window");
+        }),
     };
 }
 
@@ -745,6 +802,39 @@ sealed class Env
         File.WriteAllText(path + ".tmp", line);
         File.Move(path + ".tmp", path, true);
         Until(() => !File.Exists(path), "widget took the click");
+    }
+
+    // ClaudeWatch's usage file, as its status line writes it (temp file, then rename).
+    public string UsageFile => Path.Combine(Home, ".claude", "claudewatch-usage.json");
+    public void WriteUsage(double pct, long resetsAt) => WriteUsageRaw(JsonSerializer.Serialize(new
+    {
+        sevenDay = new { usedPercentage = pct, resetsAt },
+        fiveHour = new { usedPercentage = 3, resetsAt },
+        updatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+    }));
+    public void WriteUsageRaw(string text)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(UsageFile)!);
+        File.WriteAllText(UsageFile + ".tmp", text);
+        File.Move(UsageFile + ".tmp", UsageFile, true);
+    }
+    // What a tool call tells the session about usage: "" when nothing, else exactly one context line.
+    public string Usage(Fake f, string sid)
+    {
+        var o = f.Hook("PostToolUse", sid, tool: "Bash");
+        if (o.Length == 0) return "";
+        try
+        {
+            using var doc = JsonDocument.Parse(o);
+            var root = doc.RootElement;
+            var h = root.GetProperty("hookSpecificOutput");
+            if (root.EnumerateObject().Count() == 1 && h.EnumerateObject().Count() == 2
+                && h.GetProperty("hookEventName").GetString() == "PostToolUse"
+                && h.GetProperty("additionalContext").GetString() is string line && line.Length > 0 && !line.Contains('\n'))
+                return line;
+        }
+        catch { }
+        throw new Exception("hook.exe printed something other than one line of usage context: " + o);
     }
 
     // Files left from before the widget started (a reboot ago).
@@ -899,14 +989,15 @@ sealed class Fake
     }
 
     // Runs hook.exe for one event and returns what it printed on stdout. It must exit 0, and print
-    // nothing for anything but PreToolUse (Claude would take that output as context or an error).
+    // nothing for anything but PreToolUse and PostToolUse (Claude would take that output as context
+    // or an error).
     public string Hook(string evt, string sid, string? source = null, string? tool = null)
     {
         var payload = Payload(evt, sid, source, tool);
         var outFile = payload + ".out";
         ExpectExit0(Send($"hook\t{_env.Hook}\t{payload}\t{outFile}"), evt);
         var o = File.ReadAllText(outFile);
-        if (evt != "PreToolUse" && o.Length > 0) throw new Exception($"hook.exe printed on {evt}: {o}");
+        if (evt is not ("PreToolUse" or "PostToolUse") && o.Length > 0) throw new Exception($"hook.exe printed on {evt}: {o}");
         return o;
     }
 

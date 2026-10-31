@@ -1,8 +1,8 @@
 # Installs the Hooker hooks into %USERPROFILE%\.claude\settings.json.
 # Run it yourself - double-click "Install Hooker.cmd", or run this .ps1 directly.
 #
-# It registers hook.exe on PreToolUse (auto-approve when hooking) plus
-# UserPromptSubmit / Notification / Stop / SessionStart / SessionEnd (status + lifecycle).
+# It registers hook.exe on PreToolUse (auto-approve when hooking), PostToolUse (weekly usage %)
+# plus UserPromptSubmit / Notification / Stop / SessionStart / SessionEnd (status + lifecycle).
 # Your settings are backed up to a timestamped settings.json.hooker-backup-<stamp>, any hooks
 # you already had are preserved (only a previous Hooker entry is replaced), the new file is
 # validated as JSON before it replaces the live one, and the backup is restored on any failure.
@@ -79,6 +79,7 @@ try {
 
     $events = @{
         PreToolUse       = $withMatch
+        PostToolUse      = $withMatch
         UserPromptSubmit = $noMatch
         Notification     = $noMatch
         Stop             = $noMatch

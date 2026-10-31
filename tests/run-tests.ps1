@@ -36,12 +36,15 @@ function New-TestSrc($dir) {
     }
     $userHome = 'Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)'
     $testHome = 'Environment.GetEnvironmentVariable("HOOKER_TEST_HOME")!'
-    Edit-Src $dir 'shim\Program.cs' $userHome $testHome 2
+    Edit-Src $dir 'shim\Program.cs' $userHome $testHome 1
     Edit-Src $dir 'shim\Program.cs' '"Hooker.Widget.SingleInstance"' '"Hooker.Widget.Test.Harness"'
     Edit-Src $dir 'tray\Program.cs' $userHome $testHome 2
     Edit-Src $dir 'tray\Program.cs' '"Hooker.Widget.SingleInstance"' '"Hooker.Widget.Test.Harness"'
     # Hidden (no window pops up); after every sync, report the tiles and take any test clicks.
+    # Hiding on the first tick isn't enough: Application.Run shows the form first, so every
+    # scenario's widget flashed up on top of whatever you were doing. Refuse to ever show it.
     Edit-Src $dir 'tray\Program.cs' "bool ShouldHideForFullscreen()`n    {" "bool ShouldHideForFullscreen()`n    {`n        if (Environment.GetEnvironmentVariable(`"HOOKER_TEST_HIDDEN`") == `"1`") return true;"
+    Edit-Src $dir 'tray\Program.cs' "sealed class WidgetForm : Form`n{" "sealed class WidgetForm : Form`n{`n    protected override void SetVisibleCore(bool value) => base.SetVisibleCore(value && Environment.GetEnvironmentVariable(`"HOOKER_TEST_HIDDEN`") != `"1`");"
     Edit-Src $dir 'tray\Program.cs' "            SyncSessions();`n`n            // Poll the display topology" "            SyncSessions(); TestProbe.Dump(_order, _sessions); TestProbe.Run(ToggleSession, DismissSession);`n`n            // Poll the display topology"
     # Nothing in the test copies may still reach the real profile, Claude config or widget.
     foreach ($f in Get-ChildItem $dir -Recurse -Filter *.cs) {
@@ -234,6 +237,18 @@ $bugs = @(
     @{ Name = 'an out-of-date process record hides a live window'; File = 'tray\Program.cs'
        Find = 'if (rec == null && (written == 0 || written == was)) continue;'; Bug = 'if (written == 0 || written == was) continue;'
        Scenario = 'earlier process' },
+    @{ Name = 'usage repeated on every tool call'; File = 'shim\Program.cs'
+       Find = 'if (seen == whole.ToString()) return null;'; Bug = ''
+       Scenario = 'once per whole percent' },
+    @{ Name = 'usage rounds down (65.5% told as 65%)'; File = 'shim\Program.cs'
+       Find = 'Math.Round(pct, MidpointRounding.AwayFromZero)'; Bug = 'Math.Floor(pct)'
+       Scenario = 'once per whole percent' },
+    @{ Name = 'a week that already reset still reported'; File = 'shim\Program.cs'
+       Find = 'if (resets <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()) return null;'; Bug = ''
+       Scenario = 'missing or bad file' },
+    @{ Name = 'usage not told again after a compact or resume'; File = 'shim\Program.cs'
+       Find = "tell it again on its next tool call.`n            try { File.Delete(usageSeen); } catch { }"; Bug = 'tell it again on its next tool call.'
+       Scenario = 'resume or compact' },
     @{ Name = 'hook exits non-zero'; File = 'shim\Program.cs'
        Find = "return 0;`n`n// Which Claude process"; Bug = "return 1;`n`n// Which Claude process"
        Scenario = 'fresh session' }

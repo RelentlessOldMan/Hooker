@@ -70,7 +70,7 @@ $json = Get-Content $settings -Raw -Encoding UTF8 | ConvertFrom-Json   # UTF8: s
 $tmp = "$settings.hooker-tmp"
 try {
     if ($json.PSObject.Properties.Name -contains 'hooks') {
-        foreach ($e in @('PreToolUse','UserPromptSubmit','Notification','Stop','SessionStart','SessionEnd')) {
+        foreach ($e in @('PreToolUse','PostToolUse','UserPromptSubmit','Notification','Stop','SessionStart','SessionEnd')) {
             if ($json.hooks.PSObject.Properties.Name -notcontains $e) { continue }
             $kept = @(Remove-HookerEntries $json.hooks.$e)
             if ($kept.Count -gt 0) { $json.hooks.$e = $kept }
